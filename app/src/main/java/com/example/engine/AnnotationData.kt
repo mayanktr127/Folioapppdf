@@ -11,6 +11,7 @@ enum class AnnotationType {
     INK,
     TEXT,
     OVERLAY_EDIT,
+    TEXT_REPLACE,
     RECTANGLE,
     CIRCLE,
     SIGNATURE,
@@ -29,6 +30,19 @@ data class RectFData(
     val height: Float get() = kotlin.math.abs(bottom - top)
 }
 
+data class PdfTextBlock(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val pageIndex: Int,
+    val text: String,
+    val originalText: String = text,
+    val rect: RectFData, // Normalized coordinates (0f..1f)
+    val fontSize: Float = 14f,
+    val isBold: Boolean = false,
+    val textColor: Int = android.graphics.Color.parseColor("#182230"),
+    val backgroundColor: Int = android.graphics.Color.WHITE,
+    val isModified: Boolean = false
+)
+
 data class AnnotationData(
     val id: String = java.util.UUID.randomUUID().toString(),
     val pageIndex: Int,
@@ -36,6 +50,7 @@ data class AnnotationData(
     val points: List<Pair<Float, Float>> = emptyList(),
     val rect: RectFData? = null,
     val text: String? = null,
+    val originalText: String? = null,
     val color: Int = android.graphics.Color.RED,
     val strokeWidth: Float = 4f,
     val opacity: Float = 1.0f,

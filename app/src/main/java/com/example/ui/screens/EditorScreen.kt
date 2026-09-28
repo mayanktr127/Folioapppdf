@@ -15,11 +15,11 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -33,15 +33,14 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FindReplace
+import androidx.compose.material.icons.filled.FormatListBulleted
 import androidx.compose.material.icons.filled.Gesture
 import androidx.compose.material.icons.filled.Highlight
 import androidx.compose.material.icons.filled.NavigateBefore
 import androidx.compose.material.icons.filled.NavigateNext
-import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.filled.Numbers
 import androidx.compose.material.icons.filled.Reorder
-import androidx.compose.material.icons.filled.Save
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.WaterDrop
@@ -76,6 +75,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -87,6 +87,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.engine.AnnotationData
 import com.example.engine.AnnotationType
+import com.example.engine.PdfTextBlock
 import com.example.engine.RectFData
 import com.example.ui.theme.BorderLight
 import com.example.ui.theme.CanvasBackground
@@ -111,6 +112,7 @@ fun EditorScreen(
     val activeDoc by viewModel.activeDocument.collectAsState()
     val activePageIndex by viewModel.activePageIndex.collectAsState()
     val pageBitmap by viewModel.activePageBitmap.collectAsState()
+    val textBlocks by viewModel.currentTextBlocks.collectAsState()
     val activeTool by viewModel.editorTool.collectAsState()
     val activeColor by viewModel.activeColor.collectAsState()
     val strokeWidth by viewModel.activeStrokeWidth.collectAsState()
@@ -130,6 +132,11 @@ fun EditorScreen(
     var showAssistantSheet by remember { mutableStateOf(false) }
     var isOverlayEditMode by remember { mutableStateOf(false) }
 
+    // Text Editing states
+    var selectedBlockToEdit by remember { mutableStateOf<PdfTextBlock?>(null) }
+    var showFindReplaceDialog by remember { mutableStateOf(false) }
+    var showTextBlocksSheet by remember { mutableStateOf(false) }
+
     val savedResultDoc by viewModel.savedResultDoc.collectAsState()
 
     // Canvas Zoom & Pan
@@ -147,7 +154,7 @@ fun EditorScreen(
             .fillMaxSize()
             .background(Color(0xFFE5E7EB))
     ) {
-        // Top Bar matching Image 3 & 4
+        // Top Bar
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = SurfaceWhite,
@@ -157,7 +164,7 @@ fun EditorScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .statusBarsPadding()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -174,11 +181,11 @@ fun EditorScreen(
                 // Title & Page indicator
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                    modifier = Modifier.weight(1f).padding(horizontal = 6.dp)
                 ) {
                     Text(
                         text = doc?.title ?: "Document.pdf",
-                        fontSize = 15.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Bold,
                         color = InkPrimary,
                         maxLines = 1,
@@ -191,45 +198,69 @@ fun EditorScreen(
                     )
                 }
 
-                // Undo / Redo & Save Action
+                // Text Lines Sheet, Find & Replace, Undo, Redo & Save Action
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
+                        onClick = { showFindReplaceDialog = true },
+                        modifier = Modifier.size(34.dp).testTag("editor_find_replace_btn")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FindReplace,
+                            contentDescription = "Find and Replace",
+                            tint = CranberryPrimary,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    }
+
+                    IconButton(
+                        onClick = { showTextBlocksSheet = true },
+                        modifier = Modifier.size(34.dp).testTag("editor_text_lines_btn")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FormatListBulleted,
+                            contentDescription = "Detected Text Lines",
+                            tint = InkPrimary,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    }
+
+                    IconButton(
                         onClick = { viewModel.undo() },
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(34.dp)
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Undo,
                             contentDescription = "Undo",
                             tint = InkPrimary,
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                     }
 
                     IconButton(
                         onClick = { viewModel.redo() },
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(34.dp)
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Redo,
                             contentDescription = "Redo",
                             tint = InkPrimary,
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                     }
 
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
 
                     // Red "Save a copy" button
                     Button(
                         onClick = { viewModel.saveAnnotatedCopy() },
-                        modifier = Modifier.height(36.dp).testTag("editor_save_btn"),
+                        modifier = Modifier.height(34.dp).testTag("editor_save_btn"),
                         shape = RoundedCornerShape(10.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 0.dp)
                     ) {
                         Text(
-                            text = "Save a copy",
-                            fontSize = 12.sp,
+                            text = "Save copy",
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
                         )
                     }
@@ -251,35 +282,54 @@ fun EditorScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Active: ${activeTool.name}",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = CranberryPrimary
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(
+                            shape = CircleShape,
+                            color = CranberryPale,
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = if (activeTool == EditorTool.EDIT_PDF_TEXT) Icons.Default.Edit else Icons.Default.Draw,
+                                    contentDescription = null,
+                                    tint = CranberryPrimary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (activeTool == EditorTool.EDIT_PDF_TEXT) "Tap any text box on the page to edit" else "Active: ${activeTool.name}",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = CranberryPrimary
+                        )
+                    }
 
                     // Color palette chips
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        val colors = listOf(
-                            android.graphics.Color.parseColor("#D52B49"), // Red
-                            android.graphics.Color.parseColor("#2563EB"), // Blue
-                            android.graphics.Color.parseColor("#182230"), // Black
-                            android.graphics.Color.parseColor("#F59E0B"), // Amber Highlight
-                            android.graphics.Color.parseColor("#16A34A")  // Green
-                        )
-                        colors.forEach { c ->
-                            Box(
-                                modifier = Modifier
-                                    .size(24.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(c))
-                                    .clickable { viewModel.setActiveColor(c) }
-                                    .border(
-                                        width = if (activeColor == c) 2.dp else 0.dp,
-                                        color = if (activeColor == c) Color.White else Color.Transparent,
-                                        shape = CircleShape
-                                    )
+                    if (activeTool != EditorTool.EDIT_PDF_TEXT) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            val colors = listOf(
+                                android.graphics.Color.parseColor("#D52B49"), // Red
+                                android.graphics.Color.parseColor("#2563EB"), // Blue
+                                android.graphics.Color.parseColor("#182230"), // Black
+                                android.graphics.Color.parseColor("#F59E0B"), // Amber Highlight
+                                android.graphics.Color.parseColor("#16A34A")  // Green
                             )
+                            colors.forEach { c ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(22.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(c))
+                                        .clickable { viewModel.setActiveColor(c) }
+                                        .border(
+                                            width = if (activeColor == c) 2.dp else 0.dp,
+                                            color = if (activeColor == c) Color.White else Color.Transparent,
+                                            shape = CircleShape
+                                        )
+                                )
+                            }
                         }
                     }
 
@@ -290,7 +340,7 @@ fun EditorScreen(
             }
         }
 
-        // Central Document Canvas with Pan & Zoom & Interactive Drawing
+        // Central Document Canvas with Pan & Zoom & Interactive Drawing & Text Editing
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -316,7 +366,7 @@ fun EditorScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(16.dp)
+                        .padding(12.dp)
                         .graphicsLayer(
                             scaleX = scale,
                             scaleY = scale,
@@ -325,14 +375,17 @@ fun EditorScreen(
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Box(
+                    BoxWithConstraints(
                         modifier = Modifier
                             .fillMaxSize()
                             .clip(RoundedCornerShape(4.dp))
                             .background(Color.White)
                             .border(1.dp, BorderLight)
                     ) {
-                        // Rendered underlying PDF page bitmap
+                        val boxW = maxWidth
+                        val boxH = maxHeight
+
+                        // 1. Rendered underlying PDF page bitmap
                         Image(
                             bitmap = pageBitmap!!.asImageBitmap(),
                             contentDescription = "PDF Page",
@@ -340,12 +393,12 @@ fun EditorScreen(
                             modifier = Modifier.fillMaxSize()
                         )
 
-                        // Annotation Overlay Canvas
+                        // 2. Annotation & Replacement Text Overlay Canvas
                         Canvas(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .pointerInput(activeTool, activeColor, strokeWidth) {
-                                    if (activeTool != EditorTool.NONE) {
+                                    if (activeTool != EditorTool.NONE && activeTool != EditorTool.EDIT_PDF_TEXT) {
                                         detectDragGestures(
                                             onDragStart = { offset ->
                                                 livePoints.add(offset)
@@ -534,19 +587,47 @@ fun EditorScreen(
                                             )
                                         }
                                     }
-                                    AnnotationType.OVERLAY_EDIT -> {
+                                    AnnotationType.TEXT_REPLACE, AnnotationType.OVERLAY_EDIT -> {
                                         annot.rect?.let { r ->
+                                            // 1. Cover original text with solid white
                                             drawRect(
                                                 color = Color.White,
                                                 topLeft = Offset(r.left * w, r.top * h),
                                                 size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h)
                                             )
-                                            drawRect(
-                                                color = Color(annot.color).copy(alpha = 0.6f),
-                                                topLeft = Offset(r.left * w, r.top * h),
-                                                size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h),
-                                                style = Stroke(width = 1.5f)
-                                            )
+                                            // 2. Draw replacement text in place
+                                            if (!annot.text.isNullOrBlank()) {
+                                                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    color = annot.color
+                                                    textSize = kotlin.math.max(16f, r.height * h * 0.72f)
+                                                    isFakeBoldText = annot.strokeWidth > 1f
+                                                }
+                                                val baseline = (r.bottom * h) - (r.height * h * 0.18f)
+                                                drawContext.canvas.nativeCanvas.drawText(
+                                                    annot.text,
+                                                    r.left * w,
+                                                    baseline,
+                                                    paint
+                                                )
+                                            }
+                                        }
+                                    }
+                                    AnnotationType.TEXT -> {
+                                        annot.rect?.let { r ->
+                                            if (!annot.text.isNullOrBlank()) {
+                                                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    color = annot.color
+                                                    textSize = kotlin.math.max(16f, r.height * h * 0.72f)
+                                                    isFakeBoldText = annot.strokeWidth > 1f
+                                                }
+                                                val baseline = (r.bottom * h) - (r.height * h * 0.18f)
+                                                drawContext.canvas.nativeCanvas.drawText(
+                                                    annot.text,
+                                                    r.left * w,
+                                                    baseline,
+                                                    paint
+                                                )
+                                            }
                                         }
                                     }
                                     AnnotationType.SIGNATURE -> {
@@ -560,7 +641,30 @@ fun EditorScreen(
                                             }
                                         }
                                     }
-                                    else -> {}
+                                    AnnotationType.WATERMARK -> {
+                                        annot.text?.let { text ->
+                                            val wmPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                color = android.graphics.Color.parseColor("#44D52B49")
+                                                textSize = w * 0.08f
+                                                isFakeBoldText = true
+                                                textAlign = android.graphics.Paint.Align.CENTER
+                                            }
+                                            drawContext.canvas.nativeCanvas.save()
+                                            drawContext.canvas.nativeCanvas.rotate(-45f, w / 2f, h / 2f)
+                                            drawContext.canvas.nativeCanvas.drawText(text, w / 2f, h / 2f, wmPaint)
+                                            drawContext.canvas.nativeCanvas.restore()
+                                        }
+                                    }
+                                    AnnotationType.PAGE_NUMBER -> {
+                                        annot.text?.let { numStr ->
+                                            val numPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                color = android.graphics.Color.DKGRAY
+                                                textSize = 22f
+                                                textAlign = android.graphics.Paint.Align.CENTER
+                                            }
+                                            drawContext.canvas.nativeCanvas.drawText(numStr, w / 2f, h - 28f, numPaint)
+                                        }
+                                    }
                                 }
                             }
 
@@ -579,6 +683,34 @@ fun EditorScreen(
                                         cap = StrokeCap.Round,
                                         join = StrokeJoin.Round
                                     )
+                                )
+                            }
+                        }
+
+                        // 3. Interactive Text Blocks Overlay (When EDIT_PDF_TEXT mode is active)
+                        if (activeTool == EditorTool.EDIT_PDF_TEXT) {
+                            textBlocks.forEach { block ->
+                                val leftOffset = boxW * block.rect.left
+                                val topOffset = boxH * block.rect.top
+                                val blockW = (boxW * block.rect.width).coerceAtLeast(40.dp)
+                                val blockH = (boxH * block.rect.height).coerceAtLeast(24.dp)
+
+                                Box(
+                                    modifier = Modifier
+                                        .offset(x = leftOffset, y = topOffset)
+                                        .size(width = blockW, height = blockH)
+                                        .border(
+                                            width = 1.5.dp,
+                                            color = if (block.isModified) CranberryPrimary else Color(0xFF2563EB).copy(alpha = 0.75f),
+                                            shape = RoundedCornerShape(2.dp)
+                                        )
+                                        .background(
+                                            if (block.isModified) CranberryPale.copy(alpha = 0.35f) else Color(0xFF2563EB).copy(alpha = 0.12f)
+                                        )
+                                        .clickable {
+                                            selectedBlockToEdit = block
+                                        }
+                                        .testTag("text_block_${block.id}")
                                 )
                             }
                         }
@@ -614,8 +746,8 @@ fun EditorScreen(
             }
         }
 
-        // Bottom Toolbar matching Image 3 & 4:
-        // "Add Page" | "Edit" | "Arrange" | "Add Sign" | "AI Assistant"
+        // Bottom Toolbar:
+        // "Arrange" | "Edit Text" | "Annotate" | "Add Sign" | "Watermark" | "Folio AI"
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -626,10 +758,26 @@ fun EditorScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 10.dp, horizontal = 12.dp),
+                    .padding(vertical = 10.dp, horizontal = 8.dp),
                 horizontalArrangement = Arrangement.SpaceAround,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // Edit Text in Document (MANDATORY REQUEST)
+                EditorBottomItem(
+                    icon = Icons.Default.TextFields,
+                    label = "Edit Text",
+                    selected = activeTool == EditorTool.EDIT_PDF_TEXT,
+                    onClick = {
+                        if (activeTool == EditorTool.EDIT_PDF_TEXT) {
+                            viewModel.setEditorTool(EditorTool.NONE)
+                        } else {
+                            viewModel.setEditorTool(EditorTool.EDIT_PDF_TEXT)
+                            viewModel.setStatusMessage("Text editing active. Tap any text on page to edit.")
+                        }
+                    },
+                    testTag = "editor_tool_edit_text"
+                )
+
                 // Arrange / Rearrange
                 EditorBottomItem(
                     icon = Icons.Default.Reorder,
@@ -639,14 +787,14 @@ fun EditorScreen(
                     testTag = "editor_tool_arrange"
                 )
 
-                // Edit Tool (Ink, Highlight, Redact, etc.)
+                // Annotate (Ink, Highlight, Shapes, Redact)
                 Box {
                     EditorBottomItem(
                         icon = Icons.Default.Edit,
-                        label = "Edit",
-                        selected = activeTool != EditorTool.NONE,
+                        label = "Annotate",
+                        selected = activeTool != EditorTool.NONE && activeTool != EditorTool.EDIT_PDF_TEXT,
                         onClick = { showEditToolMenu = true },
-                        testTag = "editor_tool_edit"
+                        testTag = "editor_tool_annotate"
                     )
 
                     DropdownMenu(
@@ -654,7 +802,23 @@ fun EditorScreen(
                         onDismissRequest = { showEditToolMenu = false }
                     ) {
                         DropdownMenuItem(
-                            text = { Text("Add Text Box") },
+                            text = { Text("Edit Text in Document") },
+                            leadingIcon = { Icon(Icons.Default.TextFields, contentDescription = null, tint = CranberryPrimary) },
+                            onClick = {
+                                viewModel.setEditorTool(EditorTool.EDIT_PDF_TEXT)
+                                showEditToolMenu = false
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Find & Replace Text") },
+                            leadingIcon = { Icon(Icons.Default.FindReplace, contentDescription = null, tint = CranberryPrimary) },
+                            onClick = {
+                                showFindReplaceDialog = true
+                                showEditToolMenu = false
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Add Custom Text Box") },
                             leadingIcon = { Icon(Icons.Default.TextFields, contentDescription = null, tint = CranberryPrimary) },
                             onClick = {
                                 isOverlayEditMode = false
@@ -663,16 +827,7 @@ fun EditorScreen(
                             }
                         )
                         DropdownMenuItem(
-                            text = { Text("Overlay Edit (covers text)") },
-                            leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, tint = CranberryPrimary) },
-                            onClick = {
-                                isOverlayEditMode = true
-                                showTextDialog = true
-                                showEditToolMenu = false
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Pen / Freehand Ink") },
+                            text = { Text("Pen / Freehand Drawing") },
                             leadingIcon = { Icon(Icons.Default.Draw, contentDescription = null, tint = CranberryPrimary) },
                             onClick = {
                                 viewModel.setEditorTool(EditorTool.INK)
@@ -706,7 +861,7 @@ fun EditorScreen(
                     }
                 }
 
-                // Add Sign matching Image 3 & 4
+                // Add Sign
                 EditorBottomItem(
                     icon = Icons.Default.Gesture,
                     label = "Add Sign",
@@ -736,6 +891,52 @@ fun EditorScreen(
         }
     }
 
+    // Edit Document Text Dialog
+    selectedBlockToEdit?.let { block ->
+        EditDocumentTextDialog(
+            block = block,
+            onDismiss = { selectedBlockToEdit = null },
+            onApply = { newText, color, isBold ->
+                viewModel.editTextInPdf(block, newText, color, isBold)
+                selectedBlockToEdit = null
+            },
+            onDelete = {
+                viewModel.deleteTextInPdf(block)
+                selectedBlockToEdit = null
+            },
+            onFindAndReplaceAll = { find, replace ->
+                viewModel.executeFindAndReplace(find, replace, isEntireDoc = true)
+                selectedBlockToEdit = null
+            }
+        )
+    }
+
+    // Find and Replace Dialog
+    if (showFindReplaceDialog) {
+        FindAndReplaceDialog(
+            onDismiss = { showFindReplaceDialog = false },
+            onExecute = { find, replace, isEntireDoc ->
+                viewModel.executeFindAndReplace(find, replace, isEntireDoc)
+            }
+        )
+    }
+
+    // Page Text Blocks Sheet (List view of all text lines on page)
+    if (showTextBlocksSheet) {
+        PageTextBlocksSheet(
+            pageIndex = activePageIndex,
+            textBlocks = textBlocks,
+            onDismiss = { showTextBlocksSheet = false },
+            onSelectBlock = { block ->
+                selectedBlockToEdit = block
+            },
+            onAddNewText = {
+                isOverlayEditMode = false
+                showTextDialog = true
+            }
+        )
+    }
+
     // Signature Dialog
     if (showSignatureDialog) {
         SignatureDialog(
@@ -743,7 +944,6 @@ fun EditorScreen(
             onDismiss = { showSignatureDialog = false },
             onSignatureCreated = { sigBmp ->
                 showSignatureDialog = false
-                // Place signature in bottom center of active page
                 viewModel.addAnnotation(
                     AnnotationData(
                         pageIndex = activePageIndex,
@@ -805,41 +1005,6 @@ fun EditorScreen(
         )
     }
 
-    // Save Dialog
-    if (showSaveDialog) {
-        AlertDialog(
-            onDismissRequest = { showSaveDialog = false },
-            title = { Text("Save Document Copy", fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    Text("Save all edits, ink annotations, signatures, and page order to a new permanent PDF file.", fontSize = 13.sp, color = InkSecondary)
-                    Spacer(modifier = Modifier.height(10.dp))
-                    OutlinedTextField(
-                        value = saveCopyNameSuffix,
-                        onValueChange = { saveCopyNameSuffix = it },
-                        singleLine = true,
-                        label = { Text("File Name Suffix") }
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showSaveDialog = false
-                        viewModel.saveAnnotatedCopy(saveCopyNameSuffix)
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary),
-                    modifier = Modifier.testTag("confirm_save_copy_btn")
-                ) {
-                    Text("Save PDF")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showSaveDialog = false }) { Text("Cancel") }
-            }
-        )
-    }
-
     // Text / Overlay Edit Dialog
     if (showTextDialog) {
         AlertDialog(
@@ -861,7 +1026,7 @@ fun EditorScreen(
                                 .padding(bottom = 10.dp)
                         ) {
                             Text(
-                                text = "Overlay edit: Covers underlying text with solid white and types new text; original text may still be present in the file.",
+                                text = "Overlay edit: Covers underlying text with solid white and types new text.",
                                 fontSize = 11.sp,
                                 color = Color(0xFF856404),
                                 modifier = Modifier.padding(8.dp)
@@ -894,7 +1059,7 @@ fun EditorScreen(
                                 AnnotationData(
                                     pageIndex = activePageIndex,
                                     type = if (isOverlayEditMode) AnnotationType.OVERLAY_EDIT else AnnotationType.TEXT,
-                                    rect = RectFData(0.2f, 0.40f, 0.8f, 0.48f),
+                                    rect = RectFData(0.15f, 0.40f, 0.85f, 0.46f),
                                     text = textInput,
                                     color = activeColor
                                 )
@@ -963,7 +1128,7 @@ private fun EditorBottomItem(
         verticalArrangement = Arrangement.Center,
         modifier = Modifier
             .clickable(onClick = onClick)
-            .padding(horizontal = 8.dp, vertical = 2.dp)
+            .padding(horizontal = 6.dp, vertical = 2.dp)
             .testTag(testTag)
     ) {
         Icon(
@@ -975,7 +1140,7 @@ private fun EditorBottomItem(
         Spacer(modifier = Modifier.height(3.dp))
         Text(
             text = label,
-            fontSize = 11.sp,
+            fontSize = 10.sp,
             fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
             color = if (selected) CranberryPrimary else InkSecondary
         )

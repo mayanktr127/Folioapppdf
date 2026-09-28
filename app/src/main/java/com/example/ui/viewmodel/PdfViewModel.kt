@@ -21,6 +21,8 @@ import com.example.engine.AnnotationType
 import com.example.engine.CompressionPreset
 import com.example.engine.CompressionResult
 import com.example.engine.PdfEngine
+import com.example.engine.PdfTextBlock
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -28,6 +30,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -48,6 +51,7 @@ enum class AppScreen {
 
 enum class EditorTool {
     NONE,
+    EDIT_PDF_TEXT,
     INK,
     HIGHLIGHT,
     UNDERLINE,
@@ -76,24 +80,24 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     private val _searchQuery = MutableStateFlow("")
     val searchQuery = _searchQuery.asStateFlow()
 
-    private val _selectedFilter = MutableStateFlow("All") // "All", "Recent", "Like", categories
+    private val _selectedFilter = MutableStateFlow("All")
     val selectedFilter = _selectedFilter.asStateFlow()
 
     private val _isGridView = MutableStateFlow(false)
     val isGridView = _isGridView.asStateFlow()
 
-    // Status message for feedback
     private val _statusMessage = MutableStateFlow<String?>(null)
     val statusMessage = _statusMessage.asStateFlow()
 
-    // Saved Signatures
-    val savedSignatures: StateFlow<List<SignatureItem>> = repository.allSignatures.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5000),
-        initialValue = emptyList()
-    )
+    fun toggleGridView() {
+        _isGridView.value = !_isGridView.value
+    }
 
-    // Document Lists
+    fun clearStatusMessage() {
+        _statusMessage.value = null
+    }
+
+    // Repository Flows
     val allDocuments = repository.allDocuments.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
@@ -107,6 +111,12 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     val favoriteDocuments = repository.favoriteDocuments.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList()
+    )
+
+    val savedSignatures = repository.savedSignatures.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = emptyList()
@@ -143,6 +153,9 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _activePageBitmap = MutableStateFlow<Bitmap?>(null)
     val activePageBitmap = _activePageBitmap.asStateFlow()
+
+    private val _currentTextBlocks = MutableStateFlow<List<PdfTextBlock>>(emptyList())
+    val currentTextBlocks = _currentTextBlocks.asStateFlow()
 
     private val _editorTool = MutableStateFlow(EditorTool.NONE)
     val editorTool = _editorTool.asStateFlow()
@@ -194,7 +207,8 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
     fun navigateBack(): Boolean {
         if (screenStack.isNotEmpty()) {
-            _currentScreen.value = screenStack.removeAt(screenStack.size - 1)
+            val previous = screenStack.removeAt(screenStack.size - 1)
+            _currentScreen.value = previous
             return true
         }
         return false
@@ -208,21 +222,13 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         _selectedFilter.value = filter
     }
 
-    fun toggleGridView() {
-        _isGridView.value = !_isGridView.value
-    }
-
-    fun clearStatusMessage() {
-        _statusMessage.value = null
-    }
-
-    fun setStatusMessage(msg: String) {
+    fun setStatusMessage(msg: String?) {
         _statusMessage.value = msg
     }
 
     fun toggleFavorite(doc: PdfDocumentItem) {
         viewModelScope.launch {
-            repository.toggleFavorite(doc.id, doc.isFavorite)
+            repository.toggleFavorite(doc.id, !doc.isFavorite)
         }
     }
 
@@ -233,10 +239,10 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun importPdfFromUri(uri: Uri, displayName: String) {
+    fun importPdfFromUri(uri: Uri, displayName: String = "Imported_Document") {
         viewModelScope.launch {
             _isProcessing.value = true
-            val item = repository.importDocument(uri, displayName)
+            val item = repository.importFromUri(uri, displayName)
             _isProcessing.value = false
             if (item != null) {
                 _statusMessage.value = "Imported ${item.title}"
@@ -267,6 +273,8 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         if (file.exists()) {
             val bmp = PdfEngine.renderPageToBitmap(file, _activePageIndex.value, targetWidth = 1080)
             _activePageBitmap.value = bmp
+            val blocks = PdfEngine.extractTextBlocks(file, _activePageIndex.value)
+            _currentTextBlocks.value = blocks
         }
     }
 
@@ -296,6 +304,106 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         undoStack.add(_annotations.value.toList())
         redoStack.clear()
         _annotations.value = _annotations.value + annotation
+    }
+
+    fun editTextInPdf(block: PdfTextBlock, newText: String, color: Int, isBold: Boolean) {
+        undoStack.add(_annotations.value.toList())
+        redoStack.clear()
+        val annot = AnnotationData(
+            pageIndex = block.pageIndex,
+            type = AnnotationType.TEXT_REPLACE,
+            rect = block.rect,
+            text = newText,
+            originalText = block.text,
+            color = color,
+            strokeWidth = if (isBold) 2f else 1f
+        )
+        // Remove existing annotation targeting same rect
+        _annotations.value = _annotations.value.filterNot {
+            it.pageIndex == block.pageIndex && it.rect == block.rect
+        } + annot
+
+        // Update active page text blocks state
+        _currentTextBlocks.value = _currentTextBlocks.value.map {
+            if (it.id == block.id || (it.pageIndex == block.pageIndex && it.rect == block.rect)) {
+                it.copy(text = newText, isModified = true, textColor = color, isBold = isBold)
+            } else it
+        }
+        _statusMessage.value = "Updated text in PDF"
+    }
+
+    fun deleteTextInPdf(block: PdfTextBlock) {
+        undoStack.add(_annotations.value.toList())
+        redoStack.clear()
+        val annot = AnnotationData(
+            pageIndex = block.pageIndex,
+            type = AnnotationType.TEXT_REPLACE,
+            rect = block.rect,
+            text = "",
+            originalText = block.text,
+            color = android.graphics.Color.WHITE
+        )
+        _annotations.value = _annotations.value.filterNot {
+            it.pageIndex == block.pageIndex && it.rect == block.rect
+        } + annot
+
+        _currentTextBlocks.value = _currentTextBlocks.value.map {
+            if (it.id == block.id || (it.pageIndex == block.pageIndex && it.rect == block.rect)) {
+                it.copy(text = "", isModified = true)
+            } else it
+        }
+        _statusMessage.value = "Cleared text line"
+    }
+
+    fun executeFindAndReplace(findText: String, replaceText: String, isEntireDoc: Boolean) {
+        val doc = _activeDocument.value ?: return
+        val file = File(doc.filePath)
+        if (!file.exists() || findText.isBlank()) return
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            var totalMatches = 0
+            undoStack.add(_annotations.value.toList())
+            redoStack.clear()
+
+            val pagesToProcess = if (isEntireDoc) (0 until doc.pageCount) else listOf(_activePageIndex.value)
+            val newAnnots = _annotations.value.toMutableList()
+
+            for (p in pagesToProcess) {
+                val blocks = PdfEngine.extractTextBlocks(file, p)
+                for (block in blocks) {
+                    if (block.text.contains(findText, ignoreCase = true)) {
+                        totalMatches++
+                        val modified = block.text.replace(findText, replaceText, ignoreCase = true)
+                        newAnnots.removeAll { it.pageIndex == p && it.rect == block.rect }
+                        newAnnots.add(
+                            AnnotationData(
+                                pageIndex = p,
+                                type = AnnotationType.TEXT_REPLACE,
+                                rect = block.rect,
+                                text = modified,
+                                originalText = block.text,
+                                color = block.textColor,
+                                strokeWidth = if (block.isBold) 2f else 1f
+                            )
+                        )
+                    }
+                }
+            }
+
+            _annotations.value = newAnnots
+            _currentTextBlocks.value = _currentTextBlocks.value.map { block ->
+                if (block.text.contains(findText, ignoreCase = true)) {
+                    block.copy(
+                        text = block.text.replace(findText, replaceText, ignoreCase = true),
+                        isModified = true
+                    )
+                } else block
+            }
+
+            _isProcessing.value = false
+            _statusMessage.value = "Replaced $totalMatches match(es) in document"
+        }
     }
 
     fun undo() {
@@ -473,6 +581,200 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun splitPdfRange(doc: PdfDocumentItem, startPage: Int, endPage: Int, outputName: String) {
+        val file = File(doc.filePath)
+        if (!file.exists()) return
+        viewModelScope.launch {
+            _isProcessing.value = true
+            val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
+            val sanitized = if (outputName.endsWith(".pdf", ignoreCase = true)) outputName else "$outputName.pdf"
+            val destFile = File(docsDir, "${System.currentTimeMillis()}_$sanitized")
+            val pageIndices = ((startPage - 1).coerceAtLeast(0) until endPage.coerceAtMost(doc.pageCount)).toList()
+            val success = PdfEngine.rearrangePages(file, pageIndices, destFile)
+            if (success) {
+                val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
+                val newItem = PdfDocumentItem(
+                    title = sanitized,
+                    filePath = destFile.absolutePath,
+                    fileSize = destFile.length(),
+                    pageCount = pageIndices.size,
+                    thumbnailPath = thumb,
+                    category = doc.category
+                )
+                val id = repository.addDocument(newItem)
+                _statusMessage.value = "Extracted ${pageIndices.size} page(s) to $sanitized"
+                openDocument(newItem.copy(id = id))
+            } else {
+                _statusMessage.value = "Failed to split PDF"
+            }
+            _isProcessing.value = false
+        }
+    }
+
+    fun splitPdfAll(doc: PdfDocumentItem) {
+        val file = File(doc.filePath)
+        if (!file.exists()) return
+        viewModelScope.launch {
+            _isProcessing.value = true
+            val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
+            var count = 0
+            for (p in 0 until doc.pageCount) {
+                val destFile = File(docsDir, "${System.currentTimeMillis()}_${doc.title.removeSuffix(".pdf")}_page_${p + 1}.pdf")
+                if (PdfEngine.rearrangePages(file, listOf(p), destFile)) {
+                    count++
+                    val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
+                    val newItem = PdfDocumentItem(
+                        title = "${doc.title.removeSuffix(".pdf")}_page_${p + 1}.pdf",
+                        filePath = destFile.absolutePath,
+                        fileSize = destFile.length(),
+                        pageCount = 1,
+                        thumbnailPath = thumb,
+                        category = doc.category
+                    )
+                    repository.addDocument(newItem)
+                }
+            }
+            _isProcessing.value = false
+            _statusMessage.value = "Created $count separate PDF files"
+        }
+    }
+
+    suspend fun extractAllDocumentText(doc: PdfDocumentItem): String = withContext(Dispatchers.IO) {
+        val file = File(doc.filePath)
+        if (!file.exists()) return@withContext ""
+        val sb = StringBuilder()
+        val count = doc.pageCount
+        for (p in 0 until count) {
+            val blocks = PdfEngine.extractTextBlocks(file, p)
+            sb.append("--- PAGE ${p + 1} ---\n\n")
+            blocks.forEach { b ->
+                sb.append(b.text).append("\n")
+            }
+            sb.append("\n")
+        }
+        return@withContext sb.toString().trim()
+    }
+
+    fun rotateDocumentPages(doc: PdfDocumentItem, degrees: Float) {
+        val file = File(doc.filePath)
+        if (!file.exists()) return
+        viewModelScope.launch {
+            _isProcessing.value = true
+            val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
+            val destFile = File(docsDir, "${System.currentTimeMillis()}_rotated_${doc.title}")
+            val success = PdfEngine.rotatePages(file, degrees, destFile)
+            if (success) {
+                val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
+                val newItem = PdfDocumentItem(
+                    title = "Rotated_${doc.title}",
+                    filePath = destFile.absolutePath,
+                    fileSize = destFile.length(),
+                    pageCount = doc.pageCount,
+                    thumbnailPath = thumb,
+                    category = doc.category
+                )
+                val id = repository.addDocument(newItem)
+                _statusMessage.value = "Rotated document by ${degrees.toInt()}°"
+                openDocument(newItem.copy(id = id))
+            } else {
+                _statusMessage.value = "Failed to rotate document"
+            }
+            _isProcessing.value = false
+        }
+    }
+
+    fun protectDocument(doc: PdfDocumentItem, password: String) {
+        val file = File(doc.filePath)
+        if (!file.exists()) return
+        viewModelScope.launch {
+            _isProcessing.value = true
+            val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
+            val destFile = File(docsDir, "${System.currentTimeMillis()}_protected_${doc.title}")
+            file.copyTo(destFile, overwrite = true)
+            val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
+            val newItem = PdfDocumentItem(
+                title = "Protected_${doc.title}",
+                filePath = destFile.absolutePath,
+                fileSize = destFile.length(),
+                pageCount = doc.pageCount,
+                thumbnailPath = thumb,
+                category = "Protected",
+                isLocked = true,
+                passwordHint = password
+            )
+            repository.addDocument(newItem)
+            _statusMessage.value = "Protected '${doc.title}' with password"
+            _isProcessing.value = false
+        }
+    }
+
+    fun unlockDocument(doc: PdfDocumentItem, password: String) {
+        if (doc.passwordHint == password || !doc.isLocked) {
+            val updated = doc.copy(isLocked = false, passwordHint = null)
+            viewModelScope.launch {
+                repository.updateDocument(updated)
+                _activeDocument.value = updated
+                _statusMessage.value = "Unlocked '${doc.title}'"
+            }
+        } else {
+            _statusMessage.value = "Incorrect password"
+        }
+    }
+
+    fun repairDocument(doc: PdfDocumentItem) {
+        val file = File(doc.filePath)
+        if (!file.exists()) return
+        viewModelScope.launch {
+            _isProcessing.value = true
+            val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
+            val destFile = File(docsDir, "${System.currentTimeMillis()}_repaired_${doc.title}")
+            val success = PdfEngine.repairPdf(file, destFile)
+            if (success) {
+                val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
+                val newItem = PdfDocumentItem(
+                    title = "Repaired_${doc.title}",
+                    filePath = destFile.absolutePath,
+                    fileSize = destFile.length(),
+                    pageCount = doc.pageCount,
+                    thumbnailPath = thumb,
+                    category = doc.category
+                )
+                val id = repository.addDocument(newItem)
+                _statusMessage.value = "Repaired PDF structure successfully"
+                openDocument(newItem.copy(id = id))
+            } else {
+                _statusMessage.value = "Failed to repair document"
+            }
+            _isProcessing.value = false
+        }
+    }
+
+    suspend fun compareDocuments(doc1: PdfDocumentItem, doc2: PdfDocumentItem): String = withContext(Dispatchers.IO) {
+        val file1 = File(doc1.filePath)
+        val file2 = File(doc2.filePath)
+        return@withContext PdfEngine.comparePdfs(file1, file2)
+    }
+
+    fun applyPageNumbers(format: String) {
+        val doc = _activeDocument.value ?: return
+        for (p in 0 until doc.pageCount) {
+            val numText = when (format) {
+                "Page X of Y" -> "Page ${p + 1} of ${doc.pageCount}"
+                "Page X" -> "Page ${p + 1}"
+                "X / Y" -> "${p + 1} / ${doc.pageCount}"
+                else -> "${p + 1}"
+            }
+            addAnnotation(
+                AnnotationData(
+                    pageIndex = p,
+                    type = AnnotationType.PAGE_NUMBER,
+                    text = numText
+                )
+            )
+        }
+        _statusMessage.value = "Applied page numbers ($format)"
+    }
+
     fun rearrangeDocument(doc: PdfDocumentItem, newOrder: List<Int>) {
         val sourceFile = File(doc.filePath)
         if (!sourceFile.exists()) return
@@ -505,32 +807,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun rotateDocument(doc: PdfDocumentItem, degrees: Float) {
-        val sourceFile = File(doc.filePath)
-        if (!sourceFile.exists()) return
-
-        viewModelScope.launch {
-            _isProcessing.value = true
-            val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
-            val newTitle = "${sourceFile.nameWithoutExtension}_rotated.pdf"
-            val destFile = File(docsDir, "${System.currentTimeMillis()}_$newTitle")
-
-            val success = PdfEngine.rotatePages(sourceFile, degrees, destFile)
-            if (success) {
-                val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
-                val newItem = PdfDocumentItem(
-                    title = newTitle,
-                    filePath = destFile.absolutePath,
-                    fileSize = destFile.length(),
-                    pageCount = doc.pageCount,
-                    thumbnailPath = thumb,
-                    category = doc.category
-                )
-                val id = repository.addDocument(newItem)
-                _statusMessage.value = "Rotated pages by ${degrees.toInt()}°"
-                openDocument(newItem.copy(id = id))
-            }
-            _isProcessing.value = false
-        }
+        rotateDocumentPages(doc, degrees)
     }
 
     fun convertImagesToPdf(images: List<Bitmap>, title: String) {

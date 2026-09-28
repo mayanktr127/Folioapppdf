@@ -23,6 +23,13 @@ class PdfRepository(
     val recentDocuments: Flow<List<PdfDocumentItem>> = documentDao.getRecentDocuments()
     val favoriteDocuments: Flow<List<PdfDocumentItem>> = documentDao.getFavoriteDocuments()
     val allSignatures: Flow<List<SignatureItem>> = signatureDao.getAllSignatures()
+    val savedSignatures: Flow<List<SignatureItem>> = allSignatures
+
+    suspend fun updateDocument(item: PdfDocumentItem) = withContext(Dispatchers.IO) {
+        documentDao.updateDocument(item)
+    }
+
+    suspend fun importFromUri(uri: Uri, displayName: String = "Imported_Document"): PdfDocumentItem? = importDocument(uri, displayName)
 
     fun searchDocuments(query: String): Flow<List<PdfDocumentItem>> {
         return documentDao.searchDocuments(query)
