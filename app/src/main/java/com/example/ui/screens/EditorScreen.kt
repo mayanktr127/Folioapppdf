@@ -128,6 +128,9 @@ fun EditorScreen(
     var saveCopyNameSuffix by remember { mutableStateOf("_edited") }
     var showEditToolMenu by remember { mutableStateOf(false) }
     var showAssistantSheet by remember { mutableStateOf(false) }
+    var isOverlayEditMode by remember { mutableStateOf(false) }
+
+    val savedResultDoc by viewModel.savedResultDoc.collectAsState()
 
     // Canvas Zoom & Pan
     var scale by remember { mutableFloatStateOf(1.0f) }
@@ -216,17 +219,17 @@ fun EditorScreen(
 
                     Spacer(modifier = Modifier.width(6.dp))
 
-                    // Red "Save" button matching Image 4
+                    // Red "Save a copy" button
                     Button(
-                        onClick = { showSaveDialog = true },
+                        onClick = { viewModel.saveAnnotatedCopy() },
                         modifier = Modifier.height(36.dp).testTag("editor_save_btn"),
                         shape = RoundedCornerShape(10.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 0.dp)
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 0.dp)
                     ) {
                         Text(
-                            text = "Save",
-                            fontSize = 13.sp,
+                            text = "Save a copy",
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
                         )
                     }
@@ -531,6 +534,21 @@ fun EditorScreen(
                                             )
                                         }
                                     }
+                                    AnnotationType.OVERLAY_EDIT -> {
+                                        annot.rect?.let { r ->
+                                            drawRect(
+                                                color = Color.White,
+                                                topLeft = Offset(r.left * w, r.top * h),
+                                                size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h)
+                                            )
+                                            drawRect(
+                                                color = Color(annot.color).copy(alpha = 0.6f),
+                                                topLeft = Offset(r.left * w, r.top * h),
+                                                size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h),
+                                                style = Stroke(width = 1.5f)
+                                            )
+                                        }
+                                    }
                                     AnnotationType.SIGNATURE -> {
                                         annot.rect?.let { r ->
                                             annot.signatureBitmap?.let { sigBmp ->
@@ -635,6 +653,24 @@ fun EditorScreen(
                         expanded = showEditToolMenu,
                         onDismissRequest = { showEditToolMenu = false }
                     ) {
+                        DropdownMenuItem(
+                            text = { Text("Add Text Box") },
+                            leadingIcon = { Icon(Icons.Default.TextFields, contentDescription = null, tint = CranberryPrimary) },
+                            onClick = {
+                                isOverlayEditMode = false
+                                showTextDialog = true
+                                showEditToolMenu = false
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Overlay Edit (covers text)") },
+                            leadingIcon = { Icon(Icons.Default.Edit, contentDescription = null, tint = CranberryPrimary) },
+                            onClick = {
+                                isOverlayEditMode = true
+                                showTextDialog = true
+                                showEditToolMenu = false
+                            }
+                        )
                         DropdownMenuItem(
                             text = { Text("Pen / Freehand Ink") },
                             leadingIcon = { Icon(Icons.Default.Draw, contentDescription = null, tint = CranberryPrimary) },
@@ -800,6 +836,107 @@ fun EditorScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showSaveDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Text / Overlay Edit Dialog
+    if (showTextDialog) {
+        AlertDialog(
+            onDismissRequest = { showTextDialog = false },
+            title = {
+                Text(
+                    text = if (isOverlayEditMode) "Overlay Text Edit" else "Add Text Box",
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column {
+                    if (isOverlayEditMode) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = Color(0xFFFFF3CD),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 10.dp)
+                        ) {
+                            Text(
+                                text = "Overlay edit: Covers underlying text with solid white and types new text; original text may still be present in the file.",
+                                fontSize = 11.sp,
+                                color = Color(0xFF856404),
+                                modifier = Modifier.padding(8.dp)
+                            )
+                        }
+                    } else {
+                        Text(
+                            text = "Add a clean transparent text note onto the current page:",
+                            fontSize = 12.sp,
+                            color = InkSecondary,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                    }
+                    OutlinedTextField(
+                        value = textInput,
+                        onValueChange = { textInput = it },
+                        singleLine = true,
+                        label = { Text("Text content") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("text_input_field")
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (textInput.isNotBlank()) {
+                            viewModel.addAnnotation(
+                                AnnotationData(
+                                    pageIndex = activePageIndex,
+                                    type = if (isOverlayEditMode) AnnotationType.OVERLAY_EDIT else AnnotationType.TEXT,
+                                    rect = RectFData(0.2f, 0.40f, 0.8f, 0.48f),
+                                    text = textInput,
+                                    color = activeColor
+                                )
+                            )
+                            val modeMsg = if (isOverlayEditMode) "Placed overlay edit" else "Added text note"
+                            viewModel.setStatusMessage(modeMsg)
+                            textInput = ""
+                            showTextDialog = false
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary)
+                ) {
+                    Text("Apply")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTextDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Save Result & Download Dialog
+    savedResultDoc?.let { (newDoc, origDoc) ->
+        SaveResultDialog(
+            savedDoc = newDoc,
+            originalDoc = origDoc,
+            onDismiss = { viewModel.closeSaveResultDialog() },
+            onDownloadToDevice = { fileName ->
+                viewModel.downloadToDevice(fileName, newDoc)
+            },
+            onOpenInViewer = {
+                viewModel.closeSaveResultDialog()
+                viewModel.openDocument(newDoc)
+            },
+            onShare = {
+                viewModel.shareDocument(context, newDoc)
+            },
+            onPrint = {
+                viewModel.printDocument(context, newDoc)
+            },
+            onContinueEditing = {
+                viewModel.closeSaveResultDialog()
             }
         )
     }

@@ -1,6 +1,7 @@
 package com.example.engine
 
 import android.content.Context
+import android.net.Uri
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -488,6 +489,21 @@ object PdfEngine {
                     canvas.drawText(annot.text ?: "", r.left * pageW, r.bottom * pageH, paint)
                 }
             }
+            AnnotationType.OVERLAY_EDIT -> {
+                annot.rect?.let { r ->
+                    val coverPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.WHITE
+                        style = Paint.Style.FILL
+                    }
+                    val rectF = RectF(r.left * pageW, r.top * pageH, r.right * pageW, r.bottom * pageH)
+                    canvas.drawRect(rectF, coverPaint)
+
+                    paint.style = Paint.Style.FILL
+                    paint.textSize = max(24f, annot.strokeWidth * 6)
+                    paint.isFakeBoldText = true
+                    canvas.drawText(annot.text ?: "", r.left * pageW, r.bottom * pageH - 4f, paint)
+                }
+            }
             AnnotationType.SIGNATURE -> {
                 annot.rect?.let { r ->
                     annot.signatureBitmap?.let { sigBmp ->
@@ -553,6 +569,65 @@ object PdfEngine {
             result.add(imgFile)
         }
         return@withContext result
+    }
+
+    suspend fun verifyPdfParses(
+        pdfFile: File,
+        expectedPageCount: Int? = null
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!pdfFile.exists() || pdfFile.length() == 0L) return@withContext false
+        var pfd: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        var page: PdfRenderer.Page? = null
+        try {
+            pfd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = PdfRenderer(pfd)
+            if (renderer.pageCount <= 0) return@withContext false
+            if (expectedPageCount != null && renderer.pageCount != expectedPageCount) return@withContext false
+            page = renderer.openPage(0)
+            val testBmp = Bitmap.createBitmap(10, 10, Bitmap.Config.ARGB_8888)
+            page.render(testBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            testBmp.recycle()
+            return@withContext true
+        } catch (e: Exception) {
+            Log.e(TAG, "PDF parse verification failed for ${pdfFile.name}", e)
+            return@withContext false
+        } finally {
+            page?.close()
+            renderer?.close()
+            pfd?.close()
+        }
+    }
+
+    suspend fun exportToDownloads(
+        context: Context,
+        sourceFile: File,
+        displayName: String
+    ): Uri? = withContext(Dispatchers.IO) {
+        try {
+            val contentResolver = context.contentResolver
+            val contentValues = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS)
+                }
+            }
+            val uri = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
+            if (uri != null) {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    java.io.FileInputStream(sourceFile).use { input ->
+                        input.copyTo(out)
+                    }
+                }
+                return@withContext uri
+            } else {
+                return@withContext null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error exporting to Downloads", e)
+            return@withContext null
+        }
     }
 
     suspend fun createSampleDocuments(context: Context): List<File> = withContext(Dispatchers.IO) {

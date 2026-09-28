@@ -10,6 +10,7 @@ enum class AnnotationType {
     STRIKETHROUGH,
     INK,
     TEXT,
+    OVERLAY_EDIT,
     RECTANGLE,
     CIRCLE,
     SIGNATURE,

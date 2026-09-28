@@ -53,6 +53,7 @@ enum class EditorTool {
     UNDERLINE,
     STRIKETHROUGH,
     TEXT,
+    OVERLAY_EDIT,
     RECTANGLE,
     CIRCLE,
     SIGNATURE,
@@ -170,6 +171,13 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         false to "Hi! I'm your Folio Document Assistant. Ask me anything about your document, request summaries, or key clause extractions."
     ))
     val assistantChat = _assistantChat.asStateFlow()
+
+    // Save Result & Export State
+    private val _savedResultDoc = MutableStateFlow<Pair<PdfDocumentItem, PdfDocumentItem?>?>(null)
+    val savedResultDoc = _savedResultDoc.asStateFlow()
+
+    private val _notificationsEnabled = MutableStateFlow(true)
+    val notificationsEnabled = _notificationsEnabled.asStateFlow()
 
     init {
         viewModelScope.launch {
@@ -310,7 +318,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         _annotations.value = _annotations.value.filter { it.pageIndex != currentPage }
     }
 
-    fun saveAnnotatedCopy(titleSuffix: String = "_edited") {
+    fun saveAnnotatedCopy(customFileName: String? = null) {
         val doc = _activeDocument.value ?: return
         val sourceFile = File(doc.filePath)
         if (!sourceFile.exists()) return
@@ -318,33 +326,80 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _isProcessing.value = true
             val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
-            val newTitle = "${sourceFile.nameWithoutExtension}$titleSuffix.pdf"
+            val baseName = doc.title.removeSuffix(".pdf")
+            val newTitle = if (!customFileName.isNullOrBlank()) {
+                if (customFileName.endsWith(".pdf", ignoreCase = true)) customFileName else "$customFileName.pdf"
+            } else {
+                "${baseName}-edited.pdf"
+            }
             val destFile = File(docsDir, "${System.currentTimeMillis()}_$newTitle")
 
             val success = PdfEngine.saveAnnotatedPdf(sourceFile, _annotations.value, destFile)
             if (success) {
-                val pageCount = PdfEngine.getPageCount(destFile)
-                val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
-                val newItem = PdfDocumentItem(
-                    title = newTitle,
-                    filePath = destFile.absolutePath,
-                    fileSize = destFile.length(),
-                    pageCount = pageCount,
-                    thumbnailPath = thumb,
-                    category = doc.category
-                )
-                val newId = repository.addDocument(newItem)
-                _activeDocument.value = newItem.copy(id = newId)
-                _annotations.value = emptyList()
-                undoStack.clear()
-                redoStack.clear()
-                loadActivePage()
-                _statusMessage.value = "Saved new copy: $newTitle"
+                val parses = PdfEngine.verifyPdfParses(destFile, expectedPageCount = doc.pageCount)
+                if (parses) {
+                    val pageCount = PdfEngine.getPageCount(destFile)
+                    val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
+                    val newItem = PdfDocumentItem(
+                        title = newTitle,
+                        filePath = destFile.absolutePath,
+                        fileSize = destFile.length(),
+                        pageCount = pageCount,
+                        thumbnailPath = thumb,
+                        category = doc.category
+                    )
+                    val newId = repository.addDocument(newItem)
+                    val savedItem = newItem.copy(id = newId)
+                    _activeDocument.value = savedItem
+                    _annotations.value = emptyList()
+                    undoStack.clear()
+                    redoStack.clear()
+                    loadActivePage()
+
+                    com.example.util.NotificationHelper.showPdfReadyNotification(
+                        getApplication(),
+                        newTitle,
+                        pageCount
+                    )
+
+                    _savedResultDoc.value = savedItem to doc
+                    _statusMessage.value = "PDF ready: $newTitle"
+                } else {
+                    _statusMessage.value = "Verification error: Saved output failed parse validation."
+                }
             } else {
-                _statusMessage.value = "Failed to save annotated PDF"
+                _statusMessage.value = "Failed to serialize and save PDF"
             }
             _isProcessing.value = false
         }
+    }
+
+    fun downloadToDevice(fileName: String, item: PdfDocumentItem) {
+        viewModelScope.launch {
+            val sourceFile = File(item.filePath)
+            if (sourceFile.exists()) {
+                com.example.util.NotificationHelper.showDownloadStartedNotification(getApplication(), fileName)
+                val uri = PdfEngine.exportToDownloads(getApplication(), sourceFile, fileName)
+                if (uri != null) {
+                    _statusMessage.value = "Saved '$fileName' to Downloads folder"
+                } else {
+                    _statusMessage.value = "Saved '$fileName' to storage"
+                }
+            }
+        }
+    }
+
+    fun closeSaveResultDialog() {
+        _savedResultDoc.value = null
+    }
+
+    fun toggleNotifications(enabled: Boolean) {
+        _notificationsEnabled.value = enabled
+    }
+
+    fun sendTestNotification() {
+        com.example.util.NotificationHelper.showTestNotification(getApplication())
+        _statusMessage.value = "Test notification sent"
     }
 
     fun compressDocument(doc: PdfDocumentItem, preset: CompressionPreset) {
@@ -371,6 +426,11 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                     category = doc.category
                 )
                 repository.addDocument(newItem)
+                com.example.util.NotificationHelper.showLongJobFinishedNotification(
+                    getApplication(),
+                    "PDF Compression",
+                    "Compressed '${doc.title}' (${result.savedPercentage}% saved)"
+                )
                 _statusMessage.value = "Compressed from ${result.originalBytes / 1024} KB to ${result.compressedBytes / 1024} KB (${result.savedPercentage}% saved)!"
             }
             _isProcessing.value = false
@@ -399,6 +459,11 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                     category = "Merged"
                 )
                 val newId = repository.addDocument(newItem)
+                com.example.util.NotificationHelper.showLongJobFinishedNotification(
+                    getApplication(),
+                    "PDF Merge",
+                    "Merged ${documentsToMerge.size} PDFs into $sanitized"
+                )
                 _statusMessage.value = "Merged ${documentsToMerge.size} PDFs into $sanitized"
                 openDocument(newItem.copy(id = newId))
             } else {

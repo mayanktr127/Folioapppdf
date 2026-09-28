@@ -36,13 +36,27 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.StarOutline
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.outlined.NotificationsActive
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -133,15 +147,26 @@ fun ProfileDrawer(
 
         Spacer(modifier = Modifier.height(10.dp))
 
+        var showSettingsDialog by remember { mutableStateOf(false) }
+        val notificationsEnabled by viewModel.notificationsEnabled.collectAsState()
+
+        val notifPermissionLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestPermission()
+        ) { isGranted ->
+            viewModel.toggleNotifications(isGranted)
+            if (isGranted) {
+                viewModel.setStatusMessage("Notifications enabled for Folio PDF")
+            } else {
+                viewModel.setStatusMessage("Notification permission denied. You can re-enable in Android Settings.")
+            }
+        }
+
         // Menu Items matching Image 1 exactly:
         // Settings, Team, Report an issue, Request a feature, Rate PDF Editor, Terms of Service, Privacy Policy
         ProfileMenuItem(
             icon = Icons.Outlined.Settings,
-            label = "Settings",
-            onClick = {
-                onClose()
-                viewModel.setStatusMessage("Settings: Default A4 page size, 300 DPI, Local sandbox storage.")
-            },
+            label = "Settings & Notifications",
+            onClick = { showSettingsDialog = true },
             testTag = "profile_item_settings"
         )
 
@@ -226,6 +251,92 @@ fun ProfileDrawer(
                 text = "Protected with on-device sandbox encryption",
                 fontSize = 10.sp,
                 color = InkSecondary.copy(alpha = 0.7f)
+            )
+        }
+
+        if (showSettingsDialog) {
+            AlertDialog(
+                onDismissRequest = { showSettingsDialog = false },
+                title = { Text("Settings & Notifications", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column {
+                        Text(
+                            text = "Save Pattern",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = InkPrimary
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Default save filename: {originalName}-edited.pdf",
+                            fontSize = 12.sp,
+                            color = InkSecondary
+                        )
+
+                        Spacer(modifier = Modifier.height(14.dp))
+                        HorizontalDivider(color = BorderLight)
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Push Notifications",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = InkPrimary
+                                )
+                                Text(
+                                    text = "Real alerts when tasks finish",
+                                    fontSize = 12.sp,
+                                    color = InkSecondary
+                                )
+                            }
+                            Switch(
+                                checked = notificationsEnabled,
+                                onCheckedChange = { checked ->
+                                    if (checked && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                                    } else {
+                                        viewModel.toggleNotifications(checked)
+                                    }
+                                }
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        Text(
+                            text = "Enabled Events:\n• PDF ready (after save & verify)\n• Download started (saved to disk)\n• Long job finished (compress/merge)\n• Draft recovered",
+                            fontSize = 11.sp,
+                            color = InkSecondary,
+                            lineHeight = 16.sp
+                        )
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Button(
+                            onClick = { viewModel.sendTestNotification() },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("send_test_notif_btn"),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary)
+                        ) {
+                            Icon(Icons.Outlined.NotificationsActive, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Send test notification", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showSettingsDialog = false }) {
+                        Text("Done", color = CranberryPrimary, fontWeight = FontWeight.Bold)
+                    }
+                }
             )
         }
     }
