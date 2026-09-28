@@ -1,0 +1,52 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Document shadow -->
+    <path
+        android:fillColor="#22000000"
+        android:pathData="M34,26 L64,26 L76,38 L76,84 C76,86.2 74.2,88 72,88 L34,88 C31.8,88 30,86.2 30,84 L30,30 C30,27.8 31.8,26 34,26 Z" />
+    <!-- Document base in crisp white -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M32,24 L62,24 L74,36 L74,82 C74,84.2 72.2,86 70,86 L32,86 C29.8,86 28,84.2 28,82 L28,28 C28,25.8 29.8,24 32,24 Z" />
+    <!-- Folded corner -->
+    <path
+        android:fillColor="#E5E7EB"
+        android:pathData="M62,24 L62,36 L74,36 Z" />
+    <path
+        android:fillColor="#D1D5DB"
+        android:pathData="M62,36 L74,36 L62,24 Z" />
+    <!-- Red PDF badge on document -->
+    <path
+        android:fillColor="#D52B49"
+        android:pathData="M34,44 C34,42.5 35.2,41.5 36.5,41.5 L67.5,41.5 C68.8,41.5 70,42.5 70,44 L70,54 C70,55.5 68.8,56.5 67.5,56.5 L36.5,56.5 C35.2,56.5 34,55.5 34,54 Z" />
+    <!-- PDF Text / Lines -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M38,45 L42,45 C43.1,45 44,45.9 44,47 C44,48.1 43.1,49 42,49 L39.5,49 L39.5,53 L38,53 Z M39.5,46.5 L39.5,47.8 L41.8,47.8 C42.2,47.8 42.5,47.5 42.5,47.1 C42.5,46.8 42.2,46.5 41.8,46.5 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M46,45 L49,45 C50.7,45 52,46.3 52,49 C52,51.7 50.7,53 49,53 L46,53 Z M47.5,46.5 L47.5,51.5 L48.8,51.5 C49.8,51.5 50.4,50.6 50.4,49 C50.4,47.4 49.8,46.5 48.8,46.5 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,45 L59.5,45 L59.5,46.5 L55.5,46.5 L55.5,48.2 L58.5,48.2 L58.5,49.7 L55.5,49.7 L55.5,53 L54,53 Z" />
+    <!-- Horizontal document content lines -->
+    <path
+        android:fillColor="#CBD5E1"
+        android:pathData="M34,62 L68,62 C68.6,62 69,62.4 69,63 C69,63.6 68.6,64 68,64 L34,64 C33.4,64 33,63.6 33,63 C33,62.4 33.4,62 34,62 Z" />
+    <path
+        android:fillColor="#CBD5E1"
+        android:pathData="M34,68 L64,68 C64.6,68 65,68.4 65,69 C65,69.6 64.6,70 64,70 L34,70 C33.4,70 33,69.6 33,69 C33,68.4 33.4,68 34,68 Z" />
+    <path
+        android:fillColor="#CBD5E1"
+        android:pathData="M34,74 L54,74 C54.6,74 55,74.4 55,75 C55,75.6 54.6,76 54,76 L34,76 C33.4,76 33,75.6 33,75 C33,74.4 33.4,74 34,74 Z" />
+    <!-- Fountain pen icon on bottom right -->
+    <path
+        android:fillColor="#D52B49"
+        android:pathData="M66,66 L78,78 L75,81 L63,69 Z" />
+    <path
+        android:fillColor="#FF7A90"
+        android:pathData="M78,78 L82,82 L79,83 L75,81 Z" />
+</vector>

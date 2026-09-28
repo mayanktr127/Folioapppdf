@@ -1,0 +1,6 @@
+{
+  "name": "Folio PDF",
+  "description": "Complete PDF editor, reader, organizer, and converter with signature, compression, and annotation tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
