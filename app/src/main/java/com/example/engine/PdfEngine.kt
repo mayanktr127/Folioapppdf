@@ -15,16 +15,32 @@ import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.tom_roush.pdfbox.text.TextPosition
+import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 object PdfEngine {
     private const val TAG = "PdfEngine"
+
+    fun init(context: Context) {
+        if (!PDFBoxResourceLoader.isReady()) {
+            try {
+                PDFBoxResourceLoader.init(context.applicationContext)
+            } catch (e: Throwable) {
+                Log.e(TAG, "Error initializing PDFBoxResourceLoader", e)
+            }
+        }
+    }
 
     suspend fun renderPageToBitmap(
         pdfFile: File,
@@ -41,14 +57,21 @@ object PdfEngine {
             if (pageIndex < 0 || pageIndex >= renderer.pageCount) return@withContext null
             page = renderer.openPage(pageIndex)
 
-            val scale = targetWidth.toFloat() / page.width.toFloat()
-            val targetHeight = (page.height * scale).toInt()
+            // Cap resolution safely to prevent OutOfMemoryError on large / high-res PDF pages
+            val maxAllowedDimension = 1440
+            val pageW = max(1, page.width)
+            val pageH = max(1, page.height)
+            val scale = min(targetWidth.toFloat() / pageW, maxAllowedDimension.toFloat() / max(pageW, pageH))
+            val finalWidth = (pageW * scale).toInt().coerceIn(100, maxAllowedDimension)
+            val finalHeight = (pageH * scale).toInt().coerceIn(100, maxAllowedDimension * 2)
 
-            val bitmap = Bitmap.createBitmap(
-                max(1, targetWidth),
-                max(1, targetHeight),
-                Bitmap.Config.ARGB_8888
-            )
+            val bitmap = try {
+                Bitmap.createBitmap(finalWidth, finalHeight, Bitmap.Config.ARGB_8888)
+            } catch (_: OutOfMemoryError) {
+                System.gc()
+                Bitmap.createBitmap(finalWidth / 2, finalHeight / 2, Bitmap.Config.RGB_565)
+            }
+
             // Fill background white
             val canvas = Canvas(bitmap)
             canvas.drawColor(Color.WHITE)
@@ -217,6 +240,9 @@ object PdfEngine {
 
                 // Draw annotations for this page in target page coordinate space
                 for (annot in pageState.annotations) {
+                    if (com.example.BuildConfig.DEBUG) {
+                        Log.d(TAG, "DEBUG ASSERTION saveDocumentState: page=$newIndex, annot.pageIndex=${annot.pageIndex}, type=${annot.type}, rect=${annot.rect}, text='${annot.text}'")
+                    }
                     drawAnnotation(canvas, annot, targetPageW.toFloat(), targetPageH.toFloat(), baseBitmap = pageBmp)
                 }
 
@@ -556,21 +582,28 @@ object PdfEngine {
             val annotationsByPage = annotations.groupBy { it.pageIndex }
 
             for (pageIdx in 0 until pageCount) {
-                val pageBmp = renderPageToBitmap(sourcePdf, pageIdx, targetWidth = 1200) ?: continue
-                val pageW = pageBmp.width
-                val pageH = pageBmp.height
+                val origDims = getPageDimensions(sourcePdf, pageIdx)
+                val targetPageW = origDims?.first ?: 595
+                val targetPageH = origDims?.second ?: 842
 
-                val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, pageIdx + 1).create()
+                val renderW = max(targetPageW, 1200)
+                val pageBmp = renderPageToBitmap(sourcePdf, pageIdx, targetWidth = renderW) ?: continue
+
+                val pageInfo = PdfDocument.PageInfo.Builder(targetPageW, targetPageH, pageIdx + 1).create()
                 val page = doc.startPage(pageInfo)
                 val canvas = page.canvas
 
-                // Draw base page
-                canvas.drawBitmap(pageBmp, 0f, 0f, null)
+                // Draw base page scaled to target points
+                val dstRect = RectF(0f, 0f, targetPageW.toFloat(), targetPageH.toFloat())
+                canvas.drawBitmap(pageBmp, null, dstRect, null)
 
-                // Draw annotations on this page
+                // Draw annotations on this page in target page coordinate space
                 val pageAnnots = annotationsByPage[pageIdx] ?: emptyList()
                 for (annot in pageAnnots) {
-                    drawAnnotation(canvas, annot, pageW.toFloat(), pageH.toFloat(), baseBitmap = pageBmp)
+                    if (com.example.BuildConfig.DEBUG) {
+                        Log.d(TAG, "DEBUG ASSERTION saveAnnotatedPdf: page=$pageIdx, annot.pageIndex=${annot.pageIndex}, type=${annot.type}, rect=${annot.rect}, text='${annot.text}'")
+                    }
+                    drawAnnotation(canvas, annot, targetPageW.toFloat(), targetPageH.toFloat(), baseBitmap = pageBmp)
                 }
 
                 doc.finishPage(page)
@@ -580,7 +613,7 @@ object PdfEngine {
             FileOutputStream(outputFile).use { out ->
                 doc.writeTo(out)
             }
-            return@withContext true
+            return@withContext outputFile.exists() && outputFile.length() > 0
         } catch (e: Exception) {
             Log.e(TAG, "Error saving annotated PDF", e)
             return@withContext false
@@ -679,58 +712,83 @@ object PdfEngine {
                     val rightPx = (r.right * pageW).coerceIn(0f, pageW)
                     val bottomPx = (r.bottom * pageH).coerceIn(0f, pageH)
 
-                    // 1. Sample background color around bounding box corners to match tinted/scanned backgrounds
-                    var bgColor = Color.WHITE
-                    if (baseBitmap != null && !baseBitmap.isRecycled) {
+                    // 1. Determine background color (annot.backgroundColor or sample from baseBitmap)
+                    var bgColor = annot.backgroundColor ?: Color.WHITE
+                    if (baseBitmap != null && !baseBitmap.isRecycled && (annot.backgroundColor == null || annot.backgroundColor == Color.WHITE)) {
                         try {
-                            val sampleX = (leftPx - 4f).coerceIn(0f, (baseBitmap.width - 1).toFloat()).toInt()
-                            val sampleY = (topPx - 4f).coerceIn(0f, (baseBitmap.height - 1).toFloat()).toInt()
-                            val sampledPixel = baseBitmap.getPixel(sampleX, sampleY)
+                            val bmpX = ((r.left * baseBitmap.width).toInt() + 2).coerceIn(0, baseBitmap.width - 1)
+                            val bmpY = ((r.top * baseBitmap.height).toInt() - 2).coerceIn(0, baseBitmap.height - 1)
+                            val sampledPixel = baseBitmap.getPixel(bmpX, bmpY)
                             val red = Color.red(sampledPixel)
                             val green = Color.green(sampledPixel)
                             val blue = Color.blue(sampledPixel)
                             val lum = (0.299f * red + 0.587f * green + 0.114f * blue) / 255f
-                            if (lum > 0.25f) { // not dark text edge
+                            if (lum > 0.20f) {
                                 bgColor = sampledPixel
                             }
                         } catch (_: Exception) {}
                     }
 
+                    // 2. Erase background using tight rect (1px pad) so it never spills over container borders or clips adjacent lines
                     val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                         color = bgColor
                         style = Paint.Style.FILL
                     }
+                    val padX = 1f
+                    val padY = 1f
                     val rectF = RectF(
-                        max(0f, leftPx - 2f),
-                        max(0f, topPx - 2f),
-                        min(pageW, rightPx + 2f),
-                        min(pageH, bottomPx + 2f)
+                        max(0f, leftPx - padX),
+                        max(0f, topPx - padY),
+                        min(pageW, rightPx + padX),
+                        min(pageH, bottomPx + padY)
                     )
                     canvas.drawRect(rectF, bgPaint)
 
-                    // 2. Render modified text with matching typography, font fallback and multi-line wrap
+                    val isCentered = annot.isCentered
+
+                    // Debug assertion (Requirement 5 of Fix 1)
+                    if (com.example.BuildConfig.DEBUG) {
+                        Log.d(TAG, "DEBUG ASSERTION: target pageIndex=${annot.pageIndex}, rect=[${r.left}, ${r.top}, ${r.right}, ${r.bottom}], text='${annot.text}', isCentered=$isCentered, baselineY=${annot.baselineY}")
+                    }
+
+                    // 3. Render modified text with matching typography, font fallback and exact baseline
                     val textStr = annot.text ?: ""
                     if (textStr.isNotEmpty()) {
                         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                             color = annot.color
-                            val estimatedSize = max(14f, (r.height * pageH * 0.76f))
+                            val estimatedSize = if (annot.fontSize > 0f) {
+                                annot.fontSize * (pageH / 842f)
+                            } else {
+                                max(11f, (r.height * pageH * 0.76f))
+                            }
                             textSize = estimatedSize
-                            isFakeBoldText = annot.strokeWidth > 1f
-                            typeface = Typeface.DEFAULT
+                            isFakeBoldText = annot.strokeWidth > 1.2f
+                            textAlign = if (isCentered) Paint.Align.CENTER else Paint.Align.LEFT
+                            typeface = when (annot.fontFamily.lowercase()) {
+                                "serif", "times", "times new roman" -> if (annot.strokeWidth > 1.2f) Typeface.create(Typeface.SERIF, Typeface.BOLD) else Typeface.SERIF
+                                "monospace", "courier", "courier new" -> if (annot.strokeWidth > 1.2f) Typeface.create(Typeface.MONOSPACE, Typeface.BOLD) else Typeface.MONOSPACE
+                                else -> if (annot.strokeWidth > 1.2f) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+                            }
                         }
 
-                        val lines = textStr.split("\n")
-                        val lineHeight = textPaint.fontSpacing
-                        var currentBaseline = if (lines.size == 1) {
-                            bottomPx - (r.height * pageH * 0.18f)
+                        // Preserves text within bounds without truncating or overflowing container
+                        val availableWidth = (rightPx - leftPx)
+                        val measuredWidth = textPaint.measureText(textStr)
+                        if (measuredWidth > availableWidth && availableWidth > 50f) {
+                            val scaleRatio = availableWidth / measuredWidth
+                            if (scaleRatio >= 0.90f) {
+                                textPaint.textScaleX = scaleRatio
+                            }
+                        }
+
+                        val baseline = if (annot.baselineY != null) {
+                            annot.baselineY * pageH
                         } else {
-                            topPx + textPaint.textSize
+                            bottomPx - (bottomPx - topPx) * 0.18f
                         }
 
-                        for (line in lines) {
-                            canvas.drawText(line, leftPx, currentBaseline, textPaint)
-                            currentBaseline += lineHeight
-                        }
+                        val posX = if (isCentered) (leftPx + rightPx) / 2f else leftPx
+                        canvas.drawText(textStr, posX, baseline, textPaint)
                     }
                 }
             }
@@ -922,7 +980,7 @@ object PdfEngine {
         return@withContext results
     }
 
-    private fun createServiceAgreementPdf(file: File) {
+    fun createServiceAgreementPdf(file: File) {
         val doc = PdfDocument()
         val w = 595
         val h = 842
@@ -1258,35 +1316,480 @@ object PdfEngine {
         doc.close()
     }
 
+    private class PdfBoxLineExtractor(
+        private val targetPageIndex: Int
+    ) : PDFTextStripper() {
+        val blocks = mutableListOf<PdfTextBlock>()
+        private var pageW = 595f
+        private var pageH = 842f
+
+        init {
+            sortByPosition = true
+            startPage = targetPageIndex + 1
+            endPage = targetPageIndex + 1
+        }
+
+        override fun processPage(page: com.tom_roush.pdfbox.pdmodel.PDPage) {
+            val crop = page.cropBox ?: page.mediaBox
+            if (crop != null && crop.width > 0 && crop.height > 0) {
+                pageW = crop.width
+                pageH = crop.height
+            }
+            super.processPage(page)
+        }
+
+        override fun writeString(text: String, textPositions: MutableList<TextPosition>) {
+            val clean = text.trim()
+            if (clean.length < 2 || textPositions.isEmpty()) return
+
+            val minX = textPositions.minOf { it.xDirAdj }
+            val maxX = textPositions.maxOf { it.xDirAdj + it.widthDirAdj }
+            val minY = textPositions.minOf { it.yDirAdj - it.heightDir }
+            val maxY = textPositions.maxOf { it.yDirAdj + it.heightDir * 0.22f }
+            val baselineYPt = textPositions.first().yDirAdj
+
+            val leftNorm = (minX / pageW).coerceIn(0f, 1f)
+            val rightNorm = (maxX / pageW).coerceIn(0f, 1f)
+            val topNorm = (minY / pageH).coerceIn(0f, 1f)
+            val bottomNorm = (maxY / pageH).coerceIn(0f, 1f)
+            val baselineYNorm = (baselineYPt / pageH).coerceIn(0f, 1f)
+
+            val firstPos = textPositions.first()
+            val font = firstPos.font
+            val rawFontName = font?.name ?: "Helvetica"
+            val cleanFont = if (rawFontName.contains("+")) rawFontName.substringAfter("+") else rawFontName
+            val isBold = cleanFont.contains("bold", ignoreCase = true) || font?.fontDescriptor?.isForceBold == true
+            val fontSize = firstPos.fontSizeInPt
+
+            val isCentered = abs(leftNorm - (1f - rightNorm)) < 0.05f && (rightNorm - leftNorm) < 0.80f && leftNorm > 0.08f
+
+            blocks.add(
+                PdfTextBlock(
+                    pageIndex = targetPageIndex,
+                    text = clean,
+                    originalText = clean,
+                    rect = RectFData(leftNorm, topNorm, rightNorm, bottomNorm),
+                    fontSize = if (fontSize > 4f) fontSize else 12f,
+                    fontFamily = cleanFont,
+                    isBold = isBold,
+                    isCentered = isCentered,
+                    baselineY = baselineYNorm,
+                    textColor = Color.parseColor("#182230"),
+                    backgroundColor = Color.WHITE
+                )
+            )
+        }
+    }
+
+    suspend fun extractPdfTextUsingPdfBox(pdfFile: File, pageIndex: Int): List<PdfTextBlock> = withContext(Dispatchers.IO) {
+        if (!pdfFile.exists() || pdfFile.length() < 10) return@withContext emptyList()
+        var doc: PDDocument? = null
+        try {
+            doc = PDDocument.load(pdfFile, MemoryUsageSetting.setupTempFileOnly())
+            if (doc.isEncrypted) {
+                return@withContext emptyList()
+            }
+            val pageCount = doc.numberOfPages
+            if (pageIndex !in 0 until pageCount) return@withContext emptyList()
+
+            val extractor = PdfBoxLineExtractor(pageIndex)
+            extractor.getText(doc)
+            return@withContext extractor.blocks
+        } catch (e: Exception) {
+            Log.e(TAG, "PDFBox extraction failed for ${pdfFile.name}, falling back", e)
+            return@withContext emptyList()
+        } finally {
+            try {
+                doc?.close()
+            } catch (_: Exception) {}
+        }
+    }
+
     suspend fun extractTextBlocks(pdfFile: File, pageIndex: Int): List<PdfTextBlock> = withContext(Dispatchers.IO) {
         val fileName = pdfFile.name.lowercase()
         val blocks = mutableListOf<PdfTextBlock>()
 
-        // 1. Check for seeded/template documents
-        if (fileName.contains("service") || fileName.contains("agreement") || fileName.contains("contract")) {
+        // 1. Check for seeded/template documents (skip if it's an edited copy so edits are detected)
+        val cleanFileName = fileName.replace('_', ' ').replace('-', ' ')
+        val isTemplate = (cleanFileName == "service agreement.pdf" || (cleanFileName.contains("service agreement") && !cleanFileName.contains("edited") && !cleanFileName.contains("copy") && !cleanFileName.contains("fixed")))
+        if (isTemplate) {
             if (pageIndex == 0) {
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "SERVICE CONTRACT & MASTER AGREEMENT", rect = RectFData(0.08f, 0.05f, 0.92f, 0.09f), fontSize = 20f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "Document Reference: SC-2026-9082 • Strictly Confidential", rect = RectFData(0.12f, 0.08f, 0.88f, 0.11f), fontSize = 11f))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "I. THE PARTIES", rect = RectFData(0.07f, 0.12f, 0.35f, 0.15f), fontSize = 14f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "This Service Agreement ('Agreement') is made and entered into as of October 1, 2026,", rect = RectFData(0.07f, 0.15f, 0.93f, 0.17f), fontSize = 12f))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "Service Provider: Folio Digital Solutions LLC, 100 Innovation Way, Suite 400", rect = RectFData(0.10f, 0.19f, 0.90f, 0.22f), fontSize = 13f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "Client: Apex Ventures International, 500 Enterprise Blvd, Floor 12", rect = RectFData(0.10f, 0.22f, 0.90f, 0.25f), fontSize = 13f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "II. RECITALS & SCOPE OF SERVICES", rect = RectFData(0.07f, 0.25f, 0.60f, 0.28f), fontSize = 14f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "WHEREAS, Client desires to retain Service Provider for professional software engineering", rect = RectFData(0.07f, 0.28f, 0.93f, 0.30f), fontSize = 12f))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "III. DELIVERABLES & MILESTONES", rect = RectFData(0.07f, 0.34f, 0.60f, 0.37f), fontSize = 14f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "Phase 1: Architecture Blueprint & Security Review — Due Oct 15, 2026", rect = RectFData(0.10f, 0.39f, 0.90f, 0.42f), fontSize = 13f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "Phase 2: PDF Rendering Engine & Annotation Suite — Due Nov 01, 2026", rect = RectFData(0.10f, 0.43f, 0.90f, 0.46f), fontSize = 13f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "Phase 3: Digital Signing & AcroForm Automation — Due Nov 20, 2026", rect = RectFData(0.10f, 0.47f, 0.90f, 0.50f), fontSize = 13f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "IV. PAYMENT TERMS & COMPENSATION", rect = RectFData(0.07f, 0.55f, 0.60f, 0.58f), fontSize = 14f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "The Client agrees to pay the Service Provider a total fixed sum of $48,000 USD,", rect = RectFData(0.07f, 0.58f, 0.93f, 0.61f), fontSize = 13f))
-                blocks.add(PdfTextBlock(pageIndex = 0, text = "V. CONFIDENTIALITY & NON-DISCLOSURE", rect = RectFData(0.07f, 0.64f, 0.65f, 0.67f), fontSize = 14f, isBold = true))
+                // Title - centered, 20pt bold, baseline = 60f (0.07126f), tight glyph box (45f..64.5f)
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "SERVICE CONTRACT & MASTER AGREEMENT",
+                    rect = RectFData(0.12f, 0.0534f, 0.88f, 0.0766f),
+                    fontSize = 20f,
+                    isBold = true,
+                    isCentered = true,
+                    baselineY = 60f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230"),
+                    backgroundColor = android.graphics.Color.WHITE
+                ))
+                // Subtitle - centered, 10pt regular, baseline = 75f (0.08907f), tight glyph box (67f..77f)
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Document Reference: SC-2026-9082 • Strictly Confidential",
+                    rect = RectFData(0.14f, 0.0795f, 0.86f, 0.0915f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = true,
+                    baselineY = 75f / 842f,
+                    textColor = android.graphics.Color.parseColor("#667085"),
+                    backgroundColor = android.graphics.Color.WHITE
+                ))
+                // I. THE PARTIES - left-aligned, baseline = 110f (0.13064f)
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "I. THE PARTIES",
+                    rect = RectFData(0.0756f, 0.1187f, 0.35f, 0.1342f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 110f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "This Service Agreement ('Agreement') is made and entered into as of October 1, 2026,",
+                    rect = RectFData(0.0756f, 0.1401f, 0.92f, 0.1555f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 128f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "by and between:",
+                    rect = RectFData(0.0756f, 0.1567f, 0.30f, 0.1722f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 142f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Service Provider: Folio Digital Solutions LLC, 100 Innovation Way, Suite 400",
+                    rect = RectFData(0.1008f, 0.1805f, 0.90f, 0.1959f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 162f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Client: Apex Ventures International, 500 Enterprise Blvd, Floor 12",
+                    rect = RectFData(0.1008f, 0.1995f, 0.90f, 0.2149f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 178f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                // II. RECITALS & SCOPE OF SERVICES
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "II. RECITALS & SCOPE OF SERVICES",
+                    rect = RectFData(0.0756f, 0.2434f, 0.60f, 0.2589f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 215f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "WHEREAS, Client desires to retain Service Provider for professional software engineering,",
+                    rect = RectFData(0.0756f, 0.2648f, 0.93f, 0.2802f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 233f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "cloud architecture, document management integration, and technical advisory services;",
+                    rect = RectFData(0.0756f, 0.2814f, 0.93f, 0.2969f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 247f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "and Provider agrees to perform the Services in a professional and workmanlike manner.",
+                    rect = RectFData(0.0756f, 0.2980f, 0.93f, 0.3135f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 261f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                // III. DELIVERABLES & MILESTONES
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "III. DELIVERABLES & MILESTONES",
+                    rect = RectFData(0.0756f, 0.3384f, 0.60f, 0.3539f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 295f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                // Inside container: container fill is #F7F8FA, border at x=45f and x=550f. Lines start at x=60f (0.1008f)
+                val deliverablesBg = android.graphics.Color.parseColor("#F7F8FA")
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Phase 1: Architecture Blueprint & Security Review — Due Oct 15, 2026",
+                    rect = RectFData(0.1008f, 0.3859f, 0.835f, 0.4014f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 335f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230"),
+                    backgroundColor = deliverablesBg
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Phase 2: PDF Rendering Engine & Annotation Suite — Due Nov 01, 2026",
+                    rect = RectFData(0.1008f, 0.4156f, 0.835f, 0.4311f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 360f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230"),
+                    backgroundColor = deliverablesBg
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Phase 3: Digital Signing & AcroForm Automation — Due Nov 20, 2026",
+                    rect = RectFData(0.1008f, 0.4453f, 0.835f, 0.4608f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 385f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230"),
+                    backgroundColor = deliverablesBg
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Phase 4: Cloud Backup, Team Collaboration & Audit Logs — Due Dec 10, 2026",
+                    rect = RectFData(0.1008f, 0.4750f, 0.835f, 0.4905f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 410f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230"),
+                    backgroundColor = deliverablesBg
+                ))
+                // IV. PAYMENT TERMS & COMPENSATION
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "IV. PAYMENT TERMS & COMPENSATION",
+                    rect = RectFData(0.0756f, 0.5463f, 0.60f, 0.5617f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 470f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "The Client agrees to pay the Service Provider a total fixed sum of $48,000 USD,",
+                    rect = RectFData(0.0756f, 0.5676f, 0.93f, 0.5831f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 488f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "payable in four equal milestone installments upon verified acceptance of deliverables.",
+                    rect = RectFData(0.0756f, 0.5843f, 0.93f, 0.5997f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 502f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                // V. CONFIDENTIALITY & NON-DISCLOSURE
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "V. CONFIDENTIALITY & NON-DISCLOSURE",
+                    rect = RectFData(0.0756f, 0.6235f, 0.65f, 0.6389f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 535f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Both parties agree to hold all proprietary trade secrets, customer records, and code",
+                    rect = RectFData(0.0756f, 0.6448f, 0.93f, 0.6603f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 553f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "in strict confidence, using at least reasonable care against unauthorized disclosure.",
+                    rect = RectFData(0.0756f, 0.6615f, 0.93f, 0.6769f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 567f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 0,
+                    text = "Page 1 of 2",
+                    rect = RectFData(0.42f, 0.9536f, 0.58f, 0.9679f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = true,
+                    baselineY = 812f / 842f,
+                    textColor = android.graphics.Color.parseColor("#667085")
+                ))
             } else if (pageIndex == 1) {
-                blocks.add(PdfTextBlock(pageIndex = 1, text = "VI. TERM, TERMINATION & GOVERNING LAW", rect = RectFData(0.07f, 0.05f, 0.65f, 0.08f), fontSize = 14f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 1, text = "This Agreement shall commence on the Effective Date and remain in effect for 12 months.", rect = RectFData(0.07f, 0.08f, 0.93f, 0.11f), fontSize = 12f))
-                blocks.add(PdfTextBlock(pageIndex = 1, text = "VII. SIGNATURES & EXECUTION", rect = RectFData(0.07f, 0.17f, 0.50f, 0.20f), fontSize = 14f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 1, text = "Service Provider Representative: Alex Morgan", rect = RectFData(0.09f, 0.26f, 0.45f, 0.30f), fontSize = 14f, isBold = true))
-                blocks.add(PdfTextBlock(pageIndex = 1, text = "Date: October 1, 2026", rect = RectFData(0.09f, 0.35f, 0.40f, 0.38f), fontSize = 12f))
-                blocks.add(PdfTextBlock(pageIndex = 1, text = "Client Authorized Signatory: Pending Signature", rect = RectFData(0.50f, 0.26f, 0.90f, 0.30f), fontSize = 14f, isBold = true))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "VI. TERM, TERMINATION & GOVERNING LAW",
+                    rect = RectFData(0.0756f, 0.0475f, 0.65f, 0.0629f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 50f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "This Agreement shall commence on the Effective Date and remain in effect for 12 months.",
+                    rect = RectFData(0.0756f, 0.0688f, 0.93f, 0.0843f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 68f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "Either party may terminate upon thirty (30) days written notice for material breach.",
+                    rect = RectFData(0.0756f, 0.0855f, 0.93f, 0.1009f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 82f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "This Agreement shall be governed by and construed in accordance with the laws of California.",
+                    rect = RectFData(0.0756f, 0.1021f, 0.93f, 0.1175f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 96f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "VII. SIGNATURES & EXECUTION",
+                    rect = RectFData(0.0756f, 0.1662f, 0.50f, 0.1817f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 150f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "IN WITNESS WHEREOF, the authorized representatives have executed this Agreement.",
+                    rect = RectFData(0.0756f, 0.1876f, 0.93f, 0.2030f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 168f / 842f,
+                    textColor = android.graphics.Color.parseColor("#374151")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "Service Provider Representative:",
+                    rect = RectFData(0.0924f, 0.2494f, 0.436f, 0.2648f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 220f / 842f,
+                    textColor = android.graphics.Color.parseColor("#667085")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "Alex Morgan",
+                    rect = RectFData(0.0924f, 0.2850f, 0.40f, 0.3004f),
+                    fontSize = 11f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 250f / 842f,
+                    textColor = android.graphics.Color.parseColor("#182230")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "Date: October 1, 2026",
+                    rect = RectFData(0.0924f, 0.3444f, 0.40f, 0.3598f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 300f / 842f,
+                    textColor = android.graphics.Color.parseColor("#667085")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "Client Authorized Signatory:",
+                    rect = RectFData(0.5042f, 0.2494f, 0.85f, 0.2648f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 220f / 842f,
+                    textColor = android.graphics.Color.parseColor("#667085")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "Click or tap 'Add Sign' to sign here",
+                    rect = RectFData(0.5042f, 0.2850f, 0.85f, 0.3004f),
+                    fontSize = 10f,
+                    isBold = true,
+                    isCentered = false,
+                    baselineY = 250f / 842f,
+                    textColor = android.graphics.Color.parseColor("#D52B49")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "Date: _______________",
+                    rect = RectFData(0.5042f, 0.3444f, 0.80f, 0.3598f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = false,
+                    baselineY = 300f / 842f,
+                    textColor = android.graphics.Color.parseColor("#667085")
+                ))
+                blocks.add(PdfTextBlock(
+                    pageIndex = 1,
+                    text = "Page 2 of 2",
+                    rect = RectFData(0.42f, 0.9536f, 0.58f, 0.9679f),
+                    fontSize = 10f,
+                    isBold = false,
+                    isCentered = true,
+                    baselineY = 812f / 842f,
+                    textColor = android.graphics.Color.parseColor("#667085")
+                ))
             }
             return@withContext blocks
         }
@@ -1321,7 +1824,17 @@ object PdfEngine {
             return@withContext blocks
         }
 
-        // 2. Generic / Uploaded document text extraction with Visual Line Detection
+        // 2. High-Fidelity Unicode Text Extraction via PDFBox (Decodes ToUnicode CMaps, Identity-H CID fonts, TrueType, Type1, Encodings)
+        try {
+            val pdfBoxBlocks = extractPdfTextUsingPdfBox(pdfFile, pageIndex)
+            if (pdfBoxBlocks.isNotEmpty()) {
+                return@withContext pdfBoxBlocks
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "PDFBox extraction fallback: ${e.message}")
+        }
+
+        // 3. Generic / Uploaded document text extraction with Visual Line Detection
         try {
             val bmp = renderPageToBitmap(pdfFile, pageIndex, targetWidth = 1080)
             val visualLines = if (bmp != null) detectVisualLines(bmp) else emptyList()
@@ -1329,7 +1842,7 @@ object PdfEngine {
 
             if (visualLines.isNotEmpty()) {
                 // Map extracted text strings to detected visual lines in reading order
-                val words = textStrings.flatMap { it.split("\\s+".toRegex()) }.filter { it.isNotBlank() }
+                val words = textStrings.flatMap { it.split("\\s+".toRegex()) }.filter { it.isNotBlank() && !isGibberish(it) }
                 var wordIdx = 0
                 val totalWidth = visualLines.sumOf { it.width.toDouble() }.coerceAtLeast(1.0)
 
@@ -1343,9 +1856,9 @@ object PdfEngine {
                         sub.joinToString(" ")
                     } else ""
 
-                    val textContent = if (lineWords.isNotBlank()) {
+                    val textContent = if (lineWords.isNotBlank() && !isGibberish(lineWords)) {
                         lineWords
-                    } else if (lineIdx < textStrings.size) {
+                    } else if (lineIdx < textStrings.size && !isGibberish(textStrings[lineIdx])) {
                         textStrings[lineIdx]
                     } else {
                         "Line ${lineIdx + 1}"
@@ -1355,6 +1868,9 @@ object PdfEngine {
                         max(11f, rect.height * bmp.height * 0.70f)
                     } else 14f
 
+                    val isCentered = kotlin.math.abs(rect.left - (1.0f - rect.right)) < 0.04f && rect.width < 0.65f && rect.left > 0.12f
+                    val baselineY = (rect.bottom - rect.height * 0.18f)
+
                     blocks.add(
                         PdfTextBlock(
                             pageIndex = pageIndex,
@@ -1362,7 +1878,9 @@ object PdfEngine {
                             originalText = textContent,
                             rect = rect,
                             fontSize = estimatedFontSize,
-                            isBold = rect.height > 0.035f || textContent.length < 30
+                            isBold = rect.height > 0.035f || textContent.length < 30,
+                            isCentered = isCentered,
+                            baselineY = baselineY
                         )
                     )
                 }
@@ -1382,14 +1900,17 @@ object PdfEngine {
                 val step = min(0.048f, 0.82f / max(1, lineCount))
                 var yPos = 0.08f
                 textStrings.forEach { line ->
+                    val blockRect = RectFData(0.08f, yPos, 0.92f, (yPos + step * 0.78f).coerceAtMost(0.98f))
                     blocks.add(
                         PdfTextBlock(
                             pageIndex = pageIndex,
                             text = line,
                             originalText = line,
-                            rect = RectFData(0.08f, yPos, 0.92f, (yPos + step * 0.78f).coerceAtMost(0.98f)),
+                            rect = blockRect,
                             fontSize = 13f,
-                            isBold = line.length < 30
+                            isBold = line.length < 30,
+                            isCentered = false,
+                            baselineY = blockRect.bottom - blockRect.height * 0.18f
                         )
                     )
                     yPos += step
@@ -1574,27 +2095,57 @@ object PdfEngine {
         return result
     }
 
+    fun isGibberish(str: String): Boolean {
+        if (str.isBlank()) return false
+        val symbolCount = str.count { !it.isLetterOrDigit() && !it.isWhitespace() && it !in ".,!?-:;\"'()/$%€£@_#" }
+        return symbolCount > str.length * 0.35 || (str.length > 15 && str.count { it in "^~`\\|<>[]{}" } > 4)
+    }
+
     fun extractPdfPageTextStrings(pdfFile: File, pageIndex: Int): List<String> {
         val lines = mutableListOf<String>()
         try {
-            val bytes = pdfFile.readBytes()
-            val textContent = String(bytes, Charsets.ISO_8859_1)
+            // First attempt with PDFBox for clean decoded Unicode text
+            var doc: PDDocument? = null
+            try {
+                doc = PDDocument.load(pdfFile, MemoryUsageSetting.setupTempFileOnly())
+                if (!doc.isEncrypted && pageIndex in 0 until doc.numberOfPages) {
+                    val stripper = PDFTextStripper().apply {
+                        startPage = pageIndex + 1
+                        endPage = pageIndex + 1
+                        sortByPosition = true
+                    }
+                    val text = stripper.getText(doc)
+                    val splitLines = text.lines().map { it.trim() }.filter { it.length > 1 && !isGibberish(it) }
+                    if (splitLines.isNotEmpty()) {
+                        return splitLines
+                    }
+                }
+            } catch (_: Throwable) {
+            } finally {
+                try { doc?.close() } catch (_: Throwable) {}
+            }
 
-            // Extract all PDF streams
-            val streams = extractStreamsFromPdf(bytes)
+            // Stream-safe fallback: only read up to 2MB to prevent OOM
+            val maxBytes = min(pdfFile.length(), 2L * 1024 * 1024).toInt()
+            val buffer = ByteArray(maxBytes)
+            FileInputStream(pdfFile).use { fis ->
+                fis.read(buffer)
+            }
+            val textContent = String(buffer, Charsets.ISO_8859_1)
+
+            val streams = extractStreamsFromPdf(buffer)
             for (st in streams) {
                 val stText = String(st, Charsets.ISO_8859_1)
-                lines.addAll(parsePdfStreamText(stText))
+                lines.addAll(parsePdfStreamText(stText).filter { !isGibberish(it) })
             }
 
             if (lines.isEmpty()) {
-                // Fallback to text inside raw content
-                lines.addAll(parsePdfStreamText(textContent))
+                lines.addAll(parsePdfStreamText(textContent).filter { !isGibberish(it) })
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error extracting PDF page text strings", e)
         }
-        return lines.filter { it.length > 1 && !it.startsWith("%") }
+        return lines.filter { it.length > 1 && !it.startsWith("%") && !isGibberish(it) }
     }
 
     private fun extractStreamsFromPdf(bytes: ByteArray): List<ByteArray> {

@@ -100,9 +100,12 @@ fun PageOrganizerScreen(
 
         val file = state.sourceFile
         if (file.exists()) {
-            workingPages.forEach { page ->
-                val bmp = PdfEngine.renderPageStateToBitmap(file, page, targetWidth = 360)
-                if (bmp != null) pageThumbnails[page.pageId] = bmp
+            val initialBatch = workingPages.take(6)
+            initialBatch.forEach { page ->
+                if (!pageThumbnails.containsKey(page.pageId)) {
+                    val bmp = PdfEngine.renderPageStateToBitmap(file, page, targetWidth = 360)
+                    if (bmp != null) pageThumbnails[page.pageId] = bmp
+                }
             }
         }
     }
@@ -333,6 +336,21 @@ fun PageOrganizerScreen(
             itemsIndexed(workingPages) { index, pageState ->
                 val isSelected = selectedIndex == index
                 val bmp = pageThumbnails[pageState.pageId]
+
+                LaunchedEffect(pageState.pageId, pageState.rotationDegrees) {
+                    if (!pageThumbnails.containsKey(pageState.pageId)) {
+                        val state = docState ?: return@LaunchedEffect
+                        val rendered = PdfEngine.renderPageStateToBitmap(state.sourceFile, pageState, targetWidth = 360)
+                        if (rendered != null) {
+                            if (pageThumbnails.size > 30) {
+                                pageThumbnails.keys.firstOrNull()?.let { oldKey ->
+                                    pageThumbnails.remove(oldKey)?.recycle()
+                                }
+                            }
+                            pageThumbnails[pageState.pageId] = rendered
+                        }
+                    }
+                }
 
                 Card(
                     modifier = Modifier

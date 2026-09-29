@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -20,6 +21,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
@@ -30,6 +33,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -58,12 +63,240 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.engine.PdfTextBlock
+import com.example.ui.theme.BorderLight
 import com.example.ui.theme.CanvasBackground
 import com.example.ui.theme.CranberryPale
 import com.example.ui.theme.CranberryPrimary
 import com.example.ui.theme.InkPrimary
 import com.example.ui.theme.InkSecondary
 import com.example.ui.theme.SurfaceWhite
+
+@Composable
+fun InlineTextToolbar(
+    currentFont: String,
+    currentSize: Float,
+    isBold: Boolean,
+    currentColor: Int,
+    onFontChange: (String) -> Unit,
+    onSizeChange: (Float) -> Unit,
+    onBoldToggle: () -> Unit,
+    onColorChange: (Int) -> Unit,
+    onDone: () -> Unit,
+    onDelete: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var showFontMenu by remember { mutableStateOf(false) }
+    var showSizeMenu by remember { mutableStateOf(false) }
+    var showColorMenu by remember { mutableStateOf(false) }
+
+    val fonts = listOf("Helvetica", "Sans-Serif", "Serif", "Monospace", "Times")
+    val sizes = listOf(10f, 11f, 12f, 14f, 16f, 18f, 20f, 24f, 28f, 32f)
+    val colors = listOf(
+        android.graphics.Color.parseColor("#182230"), // Dark Slate/Black
+        android.graphics.Color.parseColor("#D52B49"), // Cranberry Primary
+        android.graphics.Color.parseColor("#2563EB"), // Blue
+        android.graphics.Color.parseColor("#16A34A"), // Green
+        android.graphics.Color.parseColor("#475467"), // Gray
+        android.graphics.Color.parseColor("#EAB308")  // Amber
+    )
+
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Color(0xFF1E293B), // Compact floating dark pill toolbar matching reference layout
+        shadowElevation = 8.dp,
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF334155)),
+        modifier = modifier.testTag("inline_floating_toolbar")
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            // 1. Font Family Dropdown
+            Box {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { showFontMenu = true }
+                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                ) {
+                    val cleanFont = when {
+                        currentFont.contains("+") -> currentFont.substringAfter("+")
+                        else -> currentFont
+                    }
+                    Text(
+                        text = if (cleanFont.length > 14) cleanFont.take(13) + "…" else cleanFont,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color.White
+                    )
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = "Select Font",
+                        tint = Color.LightGray,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+                DropdownMenu(
+                    expanded = showFontMenu,
+                    onDismissRequest = { showFontMenu = false },
+                    modifier = Modifier.background(SurfaceWhite)
+                ) {
+                    fonts.forEach { font ->
+                        DropdownMenuItem(
+                            text = { Text(font, color = InkPrimary, fontSize = 13.sp) },
+                            onClick = {
+                                onFontChange(font)
+                                showFontMenu = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            // Divider
+            Box(modifier = Modifier.width(1.dp).height(16.dp).background(Color(0xFF475467)))
+
+            // 2. Font Size Dropdown
+            Box {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { showSizeMenu = true }
+                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = "${currentSize.toInt()}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color.White
+                    )
+                    Icon(
+                        imageVector = Icons.Default.ArrowDropDown,
+                        contentDescription = "Select Size",
+                        tint = Color.LightGray,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+                DropdownMenu(
+                    expanded = showSizeMenu,
+                    onDismissRequest = { showSizeMenu = false },
+                    modifier = Modifier.background(SurfaceWhite)
+                ) {
+                    sizes.forEach { sz ->
+                        DropdownMenuItem(
+                            text = { Text("${sz.toInt()} pt", color = InkPrimary, fontSize = 13.sp) },
+                            onClick = {
+                                onSizeChange(sz)
+                                showSizeMenu = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            // Divider
+            Box(modifier = Modifier.width(1.dp).height(16.dp).background(Color(0xFF475467)))
+
+            // 3. Bold Toggle ('B')
+            Box(
+                modifier = Modifier
+                    .size(26.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (isBold) CranberryPrimary else Color.Transparent)
+                    .clickable { onBoldToggle() }
+                    .testTag("inline_bold_toggle"),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "B",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Black,
+                    color = Color.White
+                )
+            }
+
+            // Divider
+            Box(modifier = Modifier.width(1.dp).height(16.dp).background(Color(0xFF475467)))
+
+            // 4. Color Swatch Picker
+            Box {
+                Box(
+                    modifier = Modifier
+                        .size(22.dp)
+                        .clip(CircleShape)
+                        .background(Color(currentColor))
+                        .border(1.5.dp, Color.White, CircleShape)
+                        .clickable { showColorMenu = true }
+                        .testTag("inline_color_swatch")
+                )
+                DropdownMenu(
+                    expanded = showColorMenu,
+                    onDismissRequest = { showColorMenu = false },
+                    modifier = Modifier.background(SurfaceWhite)
+                ) {
+                    Row(modifier = Modifier.padding(8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        colors.forEach { c ->
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(c))
+                                    .border(
+                                        if (currentColor == c) 2.dp else 1.dp,
+                                        if (currentColor == c) CranberryPrimary else Color.LightGray,
+                                        CircleShape
+                                    )
+                                    .clickable {
+                                        onColorChange(c)
+                                        showColorMenu = false
+                                    }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Divider
+            Box(modifier = Modifier.width(1.dp).height(16.dp).background(Color(0xFF475467)))
+
+            // 5. Delete (Trash) button
+            IconButton(
+                onClick = onDelete,
+                modifier = Modifier.size(26.dp).testTag("inline_delete_btn")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Delete,
+                    contentDescription = "Clear Text",
+                    tint = Color(0xFFEF4444),
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+
+            // 6. OK / Checkmark button
+            Button(
+                onClick = onDone,
+                colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.height(26.dp).testTag("inline_done_btn")
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = "OK",
+                        tint = Color.White,
+                        modifier = Modifier.size(13.dp)
+                    )
+                    Spacer(modifier = Modifier.width(2.dp))
+                    Text("OK", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                }
+            }
+        }
+    }
+}
 
 @Composable
 fun EditDocumentTextDialog(

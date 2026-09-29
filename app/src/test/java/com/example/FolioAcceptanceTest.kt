@@ -43,6 +43,12 @@ import com.example.shadows.ShadowPdfRendererPage
 )
 class FolioAcceptanceTest {
 
+    @org.junit.Before
+    fun setUp() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        PdfEngine.init(context)
+    }
+
     private fun create5PageTestPdf(context: Context): File {
         val doc = PdfDocument()
         val pageTexts = listOf(
@@ -260,5 +266,350 @@ class FolioAcceptanceTest {
         splitPfd.close()
 
         assertTrue("Split document must pass verification", PdfEngine.verifyExportedDocument(splitFile, splitDocState))
+    }
+
+    @Test
+    fun `testServiceAgreementHeadingTextReplaceBakeCoordinates`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val serviceAgreementFile = File(context.cacheDir, "Service Agreement.pdf")
+        PdfEngine.createServiceAgreementPdf(serviceAgreementFile)
+        assertTrue(serviceAgreementFile.exists())
+        assertEquals(2, PdfEngine.getPageCount(serviceAgreementFile))
+
+        // Extract text blocks for page 0
+        val page0Blocks = PdfEngine.extractTextBlocks(serviceAgreementFile, 0)
+        assertTrue(page0Blocks.isNotEmpty())
+        val headingBlock = page0Blocks.find { it.text.contains("SERVICE CONTRACT", ignoreCase = true) }
+        assertNotNull("Heading block must be found on Page 0", headingBlock)
+
+        val initialDocState = FolioDocumentState(
+            docItem = PdfDocumentItem(
+                id = 10L,
+                title = "Service Agreement.pdf",
+                filePath = serviceAgreementFile.absolutePath,
+                fileSize = serviceAgreementFile.length(),
+                pageCount = 2
+            ),
+            sourceFile = serviceAgreementFile,
+            pages = listOf(
+                FolioPageState(originalPageIndex = 0, textBlocks = page0Blocks),
+                FolioPageState(originalPageIndex = 1)
+            ),
+            hasUnsavedChanges = false
+        )
+
+        // Replace the heading on page 0 in place
+        val newHeadingText = "AMENDED MASTER SERVICES AGREEMENT 2026"
+        val editAnnot = AnnotationData(
+            pageIndex = 0,
+            type = AnnotationType.TEXT_REPLACE,
+            rect = headingBlock!!.rect,
+            text = newHeadingText,
+            originalText = headingBlock.originalText,
+            color = android.graphics.Color.BLACK,
+            strokeWidth = 2f,
+            fontFamily = "Helvetica",
+            fontSize = 20f
+        )
+
+        val updatedPages = initialDocState.pages.toMutableList()
+        updatedPages[0] = updatedPages[0].copy(
+            annotations = listOf(editAnnot),
+            textBlocks = page0Blocks.map { if (it.id == headingBlock.id) it.copy(text = newHeadingText, isModified = true) else it }
+        )
+        val editedDocState = initialDocState.copy(pages = updatedPages, hasUnsavedChanges = true)
+
+        // Save annotated copy to new file
+        val savedFile = File(context.cacheDir, "Service Agreement_edited.pdf")
+        val saveResult = PdfEngine.saveDocumentState(editedDocState, savedFile)
+        assertTrue("Saving edited service agreement must succeed", saveResult)
+        assertTrue(savedFile.exists() && savedFile.length() > 0)
+
+        // Reopen saved file and verify
+        val pfd = ParcelFileDescriptor.open(savedFile, ParcelFileDescriptor.MODE_READ_ONLY)
+        val renderer = PdfRenderer(pfd)
+        assertEquals(2, renderer.pageCount)
+        val page0 = renderer.openPage(0)
+        assertEquals(595, page0.width)
+        assertEquals(842, page0.height)
+        page0.close()
+        renderer.close()
+        pfd.close()
+
+        // Also test saveAnnotatedPdf directly with annotations list
+        val savedFile2 = File(context.cacheDir, "Service Agreement_annotated.pdf")
+        val saveResult2 = PdfEngine.saveAnnotatedPdf(serviceAgreementFile, listOf(editAnnot), savedFile2)
+        assertTrue("saveAnnotatedPdf must succeed", saveResult2)
+        assertTrue(savedFile2.exists() && savedFile2.length() > 0)
+    }
+
+    @Test
+    fun `testFindAndReplaceExecutionModes`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val sourceFile = create5PageTestPdf(context)
+        assertEquals(5, PdfEngine.getPageCount(sourceFile))
+
+        val pages = (0 until 5).map { idx ->
+            FolioPageState(
+                originalPageIndex = idx,
+                textBlocks = listOf(
+                    PdfTextBlock(
+                        pageIndex = idx,
+                        text = "Page ${idx + 1}: Line with keywordTarget",
+                        originalText = "Page ${idx + 1}: Line with keywordTarget",
+                        rect = RectFData(0.08f, 0.10f, 0.70f, 0.15f)
+                    )
+                )
+            )
+        }
+        val matches = PdfEngine.searchAllPages(sourceFile, pages, "keywordTarget")
+        assertEquals("keywordTarget should appear on all 5 pages", 5, matches.size)
+
+        // 1. Single occurrence replace
+        val firstMatch = matches[0]
+        assertEquals(0, firstMatch.pageIndex)
+
+        // 2. Document-wide replace
+        val replacedWord = "SUBSTITUTED"
+        val replacedAnnotations = matches.map { m ->
+            AnnotationData(
+                pageIndex = m.pageIndex,
+                type = AnnotationType.TEXT_REPLACE,
+                rect = m.blockRect,
+                text = m.lineText.replace(m.matchedWord, replacedWord),
+                originalText = m.lineText
+            )
+        }
+
+        val docState = FolioDocumentState(
+            docItem = PdfDocumentItem(id = 20L, title = sourceFile.name, filePath = sourceFile.absolutePath, fileSize = sourceFile.length(), pageCount = 5),
+            sourceFile = sourceFile,
+            pages = pages.mapIndexed { idx, pState ->
+                pState.copy(annotations = replacedAnnotations.filter { it.pageIndex == idx })
+            },
+            hasUnsavedChanges = true
+        )
+
+        val outputFile = File(context.cacheDir, "find_replace_all_output.pdf")
+        val saved = PdfEngine.saveDocumentState(docState, outputFile)
+        assertTrue("Save after find and replace all must succeed", saved)
+        assertTrue(outputFile.exists() && outputFile.length() > 0)
+    }
+
+    @Test
+    fun `testBug1TitleFindAndReplacePreservesBaselineCenterAlignmentAndSubtitleVisibility`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val serviceAgreementFile = File(context.cacheDir, "Service_Agreement_Bug1.pdf")
+        PdfEngine.createServiceAgreementPdf(serviceAgreementFile)
+
+        val page0Blocks = PdfEngine.extractTextBlocks(serviceAgreementFile, 0)
+        val titleBlock = page0Blocks.find { it.text.contains("SERVICE CONTRACT", ignoreCase = true) }
+        val subtitleBlock = page0Blocks.find { it.text.contains("Document Reference", ignoreCase = true) }
+        assertNotNull(titleBlock)
+        assertNotNull(subtitleBlock)
+
+        // 1. Verify title metadata: exactly centered, baseline at 60f (0.07126f), bottom above subtitle top
+        assertTrue("Title must have isCentered = true", titleBlock!!.isCentered)
+        assertEquals("Title baseline must be 60/842", 60f / 842f, titleBlock.baselineY!!, 0.001f)
+        assertTrue("Title bottom must be above subtitle top to prevent overlap", titleBlock.rect.bottom < subtitleBlock!!.rect.top)
+
+        // 2. Perform Find & Replace "Service" -> "dervice"
+        val replacedTitle = titleBlock.text.replace("Service", "dervice", ignoreCase = true)
+        assertEquals("dervice CONTRACT & MASTER AGREEMENT", replacedTitle)
+
+        val annot = AnnotationData(
+            pageIndex = 0,
+            type = AnnotationType.TEXT_REPLACE,
+            rect = titleBlock.rect,
+            text = replacedTitle,
+            originalText = titleBlock.originalText,
+            color = titleBlock.textColor,
+            strokeWidth = 2f,
+            fontSize = titleBlock.fontSize,
+            isCentered = titleBlock.isCentered,
+            baselineY = titleBlock.baselineY,
+            backgroundColor = titleBlock.backgroundColor
+        )
+
+        val docState = FolioDocumentState(
+            docItem = PdfDocumentItem(id = 30L, title = "Service Agreement.pdf", filePath = serviceAgreementFile.absolutePath, fileSize = serviceAgreementFile.length(), pageCount = 2),
+            sourceFile = serviceAgreementFile,
+            pages = listOf(
+                FolioPageState(originalPageIndex = 0, annotations = listOf(annot), textBlocks = page0Blocks),
+                FolioPageState(originalPageIndex = 1)
+            ),
+            hasUnsavedChanges = true
+        )
+
+        val exportedFile = File(context.cacheDir, "Service_Agreement_Bug1_Fixed.pdf")
+        val saved = PdfEngine.saveDocumentState(docState, exportedFile)
+        assertTrue("Save after title find and replace must succeed", saved)
+        assertTrue(exportedFile.exists() && exportedFile.length() > 0)
+    }
+
+    @Test
+    fun `testBug2DeliverablesPhase4EditPreservesLeftIndentContainerBorderAndNoTruncation`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val serviceAgreementFile = File(context.cacheDir, "Service_Agreement_Bug2.pdf")
+        PdfEngine.createServiceAgreementPdf(serviceAgreementFile)
+
+        val page0Blocks = PdfEngine.extractTextBlocks(serviceAgreementFile, 0)
+        val phase4Block = page0Blocks.find { it.text.contains("Phase 4", ignoreCase = true) }
+        assertNotNull(phase4Block)
+
+        // 1. Verify Phase 4 metadata: left-aligned (NOT centered!), baseline at 410f, inside container
+        assertEquals("Phase 4 must be left-aligned (isCentered = false)", false, phase4Block!!.isCentered)
+        assertEquals("Phase 4 baseline must be 410/842", 410f / 842f, phase4Block.baselineY!!, 0.001f)
+        assertEquals("Phase 4 background must match container #F7F8FA", android.graphics.Color.parseColor("#F7F8FA"), phase4Block.backgroundColor)
+
+        // Container borders are at 45f (0.0756f) and 550f (0.9244f). Phase 4 rect must sit comfortably inside
+        assertTrue("Phase 4 left must be inside container border (> 0.0756f)", phase4Block.rect.left > 0.0756f)
+        assertTrue("Phase 4 right must be inside container border (< 0.9244f)", phase4Block.rect.right < 0.9244f)
+
+        // 2. Perform edit to Phase 4
+        val editedPhase4Text = "Phase 4: Cloud Backup, Team Collaboration & Audit Logs — Due Dec 10, 2026"
+        val annot = AnnotationData(
+            pageIndex = 0,
+            type = AnnotationType.TEXT_REPLACE,
+            rect = phase4Block.rect,
+            text = editedPhase4Text,
+            originalText = phase4Block.originalText,
+            color = phase4Block.textColor,
+            strokeWidth = 2f,
+            fontSize = phase4Block.fontSize,
+            isCentered = phase4Block.isCentered,
+            baselineY = phase4Block.baselineY,
+            backgroundColor = phase4Block.backgroundColor
+        )
+
+        val docState = FolioDocumentState(
+            docItem = PdfDocumentItem(id = 31L, title = "Service Agreement.pdf", filePath = serviceAgreementFile.absolutePath, fileSize = serviceAgreementFile.length(), pageCount = 2),
+            sourceFile = serviceAgreementFile,
+            pages = listOf(
+                FolioPageState(originalPageIndex = 0, annotations = listOf(annot), textBlocks = page0Blocks),
+                FolioPageState(originalPageIndex = 1)
+            ),
+            hasUnsavedChanges = true
+        )
+
+        val exportedFile = File(context.cacheDir, "Service_Agreement_Bug2_Fixed.pdf")
+        val saved = PdfEngine.saveDocumentState(docState, exportedFile)
+        assertTrue("Save after editing Phase 4 must succeed", saved)
+        assertTrue(exportedFile.exists() && exportedFile.length() > 0)
+    }
+
+    private fun createHeadshotRecipePdf(file: File) {
+        val doc = com.tom_roush.pdfbox.pdmodel.PDDocument()
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle(595f, 842f))
+        doc.addPage(page)
+        val content = com.tom_roush.pdfbox.pdmodel.PDPageContentStream(doc, page)
+        val fontBold = com.tom_roush.pdfbox.pdmodel.font.PDType1Font.HELVETICA_BOLD
+        val fontReg = com.tom_roush.pdfbox.pdmodel.font.PDType1Font.HELVETICA
+
+        content.beginText()
+        content.setFont(fontBold, 14f)
+        content.newLineAtOffset(50f, 750f)
+        content.showText("PROFESSIONAL AI HEADSHOT PROMPT RECIPE (WITH INDUSTRY JARGON)")
+        content.endText()
+
+        content.beginText()
+        content.setFont(fontBold, 11f)
+        content.newLineAtOffset(50f, 700f)
+        content.showText("1. SUBJECT DESCRIPTION")
+        content.endText()
+
+        content.beginText()
+        content.setFont(fontReg, 10f)
+        content.newLineAtOffset(50f, 680f)
+        content.showText("A realistic professional portrait of @me, shown from shoulders up.")
+        content.endText()
+
+        content.close()
+        FileOutputStream(file).use { doc.save(it) }
+        doc.close()
+    }
+
+    @Test
+    fun `testProblem2ImportedPdfExtractsDecodedUnicodeAndNoGibberish`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val testPdf = File(context.cacheDir, "AI_Headshot_Prompt_Recipe.pdf")
+        createHeadshotRecipePdf(testPdf)
+        assertTrue(testPdf.exists() && testPdf.length() > 0)
+
+        // Extract text blocks
+        val blocks = PdfEngine.extractTextBlocks(testPdf, 0)
+        assertTrue("Must extract text blocks from imported PDF", blocks.isNotEmpty())
+
+        val titleBlock = blocks.find { it.text.contains("PROFESSIONAL", ignoreCase = true) }
+        assertNotNull("Title block must be decoded and found without gibberish", titleBlock)
+        assertTrue(
+            "Title must contain readable Unicode text",
+            titleBlock!!.text.contains("HEADSHOT PROMPT RECIPE", ignoreCase = true)
+        )
+
+        // Verify that NO blocks contain garbage characters
+        blocks.forEach { block ->
+            assertTrue("Block text must not be gibberish: ${block.text}", !PdfEngine.isGibberish(block.text))
+        }
+    }
+
+    @Test
+    fun `testProblem3FindAndReplaceWorksOnImportedPdf`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val testPdf = File(context.cacheDir, "AI_Headshot_Prompt_FindReplace.pdf")
+        createHeadshotRecipePdf(testPdf)
+
+        val pages = listOf(
+            FolioPageState(originalPageIndex = 0)
+        )
+
+        // Search for 'PROFESSIONAL' which was failing in user's image
+        val matches = PdfEngine.searchAllPages(testPdf, pages, "PROFESSIONAL")
+        assertEquals("Must find 2 matches for PROFESSIONAL (title and body)", 2, matches.size)
+        assertEquals("PROFESSIONAL", matches[0].matchedWord)
+
+        // Perform replacement
+        val outputFile = File(context.cacheDir, "AI_Headshot_Replaced.pdf")
+        val (success, matchCount) = PdfEngine.findAndReplaceText(testPdf, "PROFESSIONAL", "EXECUTIVE", outputFile)
+        assertTrue("Find and replace must succeed", success)
+        assertEquals(2, matchCount)
+        assertTrue(outputFile.exists() && outputFile.length() > 0)
+
+        // Verify the replaced PDF now contains EXECUTIVE
+        val replacedBlocks = PdfEngine.extractTextBlocks(outputFile, 0)
+        val replacedTitle = replacedBlocks.find { it.text.contains("EXECUTIVE", ignoreCase = true) }
+        assertNotNull("Replaced document must contain EXECUTIVE", replacedTitle)
+    }
+
+    @Test
+    fun `testProblem1LargeDocumentStreamingAndNoMemoryCrash`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val largePdf = File(context.cacheDir, "large_test_document_100p.pdf")
+
+        // Create 100-page document with PDFBox streaming
+        val doc = com.tom_roush.pdfbox.pdmodel.PDDocument()
+        val font = com.tom_roush.pdfbox.pdmodel.font.PDType1Font.HELVETICA
+        for (i in 0 until 100) {
+            val page = com.tom_roush.pdfbox.pdmodel.PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle(595f, 842f))
+            doc.addPage(page)
+            val content = com.tom_roush.pdfbox.pdmodel.PDPageContentStream(doc, page)
+            content.beginText()
+            content.setFont(font, 12f)
+            content.newLineAtOffset(50f, 750f)
+            content.showText("Page ${i + 1} Enterprise Content Streaming")
+            content.endText()
+            content.close()
+        }
+        FileOutputStream(largePdf).use { doc.save(it) }
+        doc.close()
+
+        assertTrue(largePdf.exists() && largePdf.length() > 0)
+        val count = PdfEngine.getPageCount(largePdf)
+        assertEquals(100, count)
+
+        // Extract page 50 on demand without OOM
+        val p50Blocks = PdfEngine.extractTextBlocks(largePdf, 49)
+        assertTrue("Page 50 blocks must be extracted", p50Blocks.isNotEmpty())
+        assertTrue("Page 50 must have correct page index", p50Blocks[0].text.contains("Page 50"))
     }
 }

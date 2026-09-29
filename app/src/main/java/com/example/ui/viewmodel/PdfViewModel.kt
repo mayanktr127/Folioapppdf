@@ -396,22 +396,34 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         _annotations.value = updatedAnnots
     }
 
-    fun editTextInPdf(block: PdfTextBlock, newText: String, color: Int, isBold: Boolean) {
+    fun editTextInPdf(
+        block: PdfTextBlock,
+        newText: String,
+        color: Int,
+        isBold: Boolean,
+        fontFamily: String = "Helvetica",
+        fontSize: Float = 14f
+    ) {
         val state = _docState.value ?: return
-        val safeIndex = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
-        val pageState = state.pages[safeIndex]
+        val targetIndex = block.pageIndex.coerceIn(0, state.pages.size - 1)
+        val pageState = state.pages[targetIndex]
 
         undoStateStack.add(state)
         redoStateStack.clear()
 
         val annot = AnnotationData(
-            pageIndex = safeIndex,
+            pageIndex = targetIndex,
             type = AnnotationType.TEXT_REPLACE,
             rect = block.rect,
             text = newText,
             originalText = block.originalText,
             color = color,
-            strokeWidth = if (isBold) 2f else 1f
+            strokeWidth = if (isBold) 2f else 1f,
+            fontFamily = fontFamily,
+            fontSize = fontSize,
+            isCentered = block.isCentered,
+            baselineY = block.baselineY,
+            backgroundColor = block.backgroundColor
         )
 
         val updatedAnnots = pageState.annotations.filterNot {
@@ -420,32 +432,41 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
         val updatedBlocks = pageState.textBlocks.map {
             if (it.id == block.id || it.rect == block.rect) {
-                it.copy(text = newText, isModified = true, textColor = color, isBold = isBold)
+                it.copy(
+                    text = newText,
+                    isModified = true,
+                    textColor = color,
+                    isBold = isBold,
+                    fontFamily = fontFamily,
+                    fontSize = fontSize
+                )
             } else it
         }
 
         val updatedPages = state.pages.toMutableList()
-        updatedPages[safeIndex] = pageState.copy(
+        updatedPages[targetIndex] = pageState.copy(
             annotations = updatedAnnots,
             textBlocks = updatedBlocks
         )
 
         _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
-        _annotations.value = updatedAnnots
-        _currentTextBlocks.value = updatedBlocks
+        if (_activePageIndex.value == targetIndex) {
+            _annotations.value = updatedAnnots
+            _currentTextBlocks.value = updatedBlocks
+        }
         _statusMessage.value = "Updated text in PDF"
     }
 
     fun deleteTextInPdf(block: PdfTextBlock) {
         val state = _docState.value ?: return
-        val safeIndex = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
-        val pageState = state.pages[safeIndex]
+        val targetIndex = block.pageIndex.coerceIn(0, state.pages.size - 1)
+        val pageState = state.pages[targetIndex]
 
         undoStateStack.add(state)
         redoStateStack.clear()
 
         val annot = AnnotationData(
-            pageIndex = safeIndex,
+            pageIndex = targetIndex,
             type = AnnotationType.TEXT_REPLACE,
             rect = block.rect,
             text = "",
@@ -464,14 +485,16 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val updatedPages = state.pages.toMutableList()
-        updatedPages[safeIndex] = pageState.copy(
+        updatedPages[targetIndex] = pageState.copy(
             annotations = updatedAnnots,
             textBlocks = updatedBlocks
         )
 
         _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
-        _annotations.value = updatedAnnots
-        _currentTextBlocks.value = updatedBlocks
+        if (_activePageIndex.value == targetIndex) {
+            _annotations.value = updatedAnnots
+            _currentTextBlocks.value = updatedBlocks
+        }
         _statusMessage.value = "Cleared text line"
     }
 
@@ -512,7 +535,12 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                                 text = replaced,
                                 originalText = b.originalText,
                                 color = b.textColor,
-                                strokeWidth = if (b.isBold) 2f else 1f
+                                strokeWidth = if (b.isBold) 2f else 1f,
+                                fontFamily = b.fontFamily,
+                                fontSize = b.fontSize,
+                                isCentered = b.isCentered,
+                                baselineY = b.baselineY,
+                                backgroundColor = b.backgroundColor
                             )
                         )
                         b.copy(text = replaced, isModified = true)
@@ -560,12 +588,25 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         val pageState = state.pages[pageIdx]
 
         val newText = match.lineText.replace(match.matchedWord, replacement, ignoreCase = true)
+        val block = pageState.textBlocks.find { it.rect == match.blockRect || it.id == match.textBlockId }
+        val textColor = block?.textColor ?: android.graphics.Color.parseColor("#182230")
+        val isBold = block?.isBold ?: false
+        val fontFamily = block?.fontFamily ?: "Helvetica"
+        val fontSize = block?.fontSize ?: 14f
+
         val annot = AnnotationData(
             pageIndex = pageIdx,
             type = AnnotationType.TEXT_REPLACE,
             rect = match.blockRect,
             text = newText,
-            originalText = match.lineText
+            originalText = match.lineText,
+            color = textColor,
+            strokeWidth = if (isBold) 2f else 1f,
+            fontFamily = fontFamily,
+            fontSize = fontSize,
+            isCentered = block?.isCentered ?: false,
+            baselineY = block?.baselineY,
+            backgroundColor = block?.backgroundColor
         )
 
         val updatedAnnots = pageState.annotations.filterNot {
@@ -574,7 +615,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
         val updatedBlocks = pageState.textBlocks.map { b ->
             if (b.rect == match.blockRect || b.id == match.textBlockId) {
-                b.copy(text = newText, isModified = true)
+                b.copy(text = newText, isModified = true, textColor = textColor, isBold = isBold, fontFamily = fontFamily, fontSize = fontSize)
             } else b
         }
 
@@ -602,49 +643,55 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         undoStateStack.add(state)
         redoStateStack.clear()
 
-        val pageState = state.pages[pageIdx]
-        val blocks = if (pageState.textBlocks.isNotEmpty()) {
-            pageState.textBlocks
-        } else {
-            pageState.textBlocks
-        }
-
-        val newAnnots = pageState.annotations.toMutableList()
-        var count = 0
-        val updatedBlocks = blocks.map { b ->
-            if (b.text.contains(query, ignoreCase = true)) {
-                count++
-                val replaced = b.text.replace(query, replacement, ignoreCase = true)
-                newAnnots.removeAll { it.rect == b.rect && it.type == AnnotationType.TEXT_REPLACE }
-                newAnnots.add(
-                    AnnotationData(
-                        pageIndex = pageIdx,
-                        type = AnnotationType.TEXT_REPLACE,
-                        rect = b.rect,
-                        text = replaced,
-                        originalText = b.originalText
-                    )
-                )
-                b.copy(text = replaced, isModified = true)
-            } else b
-        }
-
-        val updatedPages = state.pages.toMutableList()
-        updatedPages[pageIdx] = pageState.copy(
-            annotations = newAnnots,
-            textBlocks = updatedBlocks
-        )
-
-        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
-        _searchMatches.value = _searchMatches.value.filterNot { it.pageIndex == pageIdx }
-
         viewModelScope.launch {
+            val pageState = state.pages[pageIdx]
+            val blocks = if (pageState.textBlocks.isNotEmpty()) {
+                pageState.textBlocks
+            } else {
+                PdfEngine.extractTextBlocks(state.sourceFile, pageState.originalPageIndex)
+            }
+
+            val newAnnots = pageState.annotations.toMutableList()
+            var count = 0
+            val updatedBlocks = blocks.map { b ->
+                if (b.text.contains(query, ignoreCase = true)) {
+                    count++
+                    val replaced = b.text.replace(query, replacement, ignoreCase = true)
+                    newAnnots.removeAll { it.rect == b.rect && it.type == AnnotationType.TEXT_REPLACE }
+                    newAnnots.add(
+                        AnnotationData(
+                            pageIndex = pageIdx,
+                            type = AnnotationType.TEXT_REPLACE,
+                            rect = b.rect,
+                            text = replaced,
+                            originalText = b.originalText,
+                            color = b.textColor,
+                            strokeWidth = if (b.isBold) 2f else 1f,
+                            fontFamily = b.fontFamily,
+                            fontSize = b.fontSize,
+                            isCentered = b.isCentered,
+                            baselineY = b.baselineY,
+                            backgroundColor = b.backgroundColor
+                        )
+                    )
+                    b.copy(text = replaced, isModified = true)
+                } else b
+            }
+
+            val updatedPages = state.pages.toMutableList()
+            updatedPages[pageIdx] = pageState.copy(
+                annotations = newAnnots,
+                textBlocks = updatedBlocks
+            )
+
+            _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+            _searchMatches.value = _searchMatches.value.filterNot { it.pageIndex == pageIdx }
+
             if (_activePageIndex.value != pageIdx) {
                 _activePageIndex.value = pageIdx
             }
             loadActivePage()
         }
-        _statusMessage.value = "Replaced $count match(es) on Page ${pageIdx + 1}"
     }
 
     fun replaceAllInDocument(query: String, replacement: String) {
@@ -788,9 +835,22 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                     val newId = repository.addDocument(newItem)
                     val savedItem = newItem.copy(id = newId)
 
-                    // Update active state to saved item and clear unsaved changes flag
-                    _docState.value = state.copy(docItem = savedItem, sourceFile = destFile, hasUnsavedChanges = false)
+                    // Update active state to saved item, clear baked annotations so they aren't double-baked
+                    val bakedPages = state.pages.mapIndexed { idx, p ->
+                        p.copy(
+                            originalPageIndex = idx,
+                            rotationDegrees = 0f,
+                            annotations = emptyList()
+                        )
+                    }
+                    _docState.value = state.copy(
+                        docItem = savedItem,
+                        sourceFile = destFile,
+                        pages = bakedPages,
+                        hasUnsavedChanges = false
+                    )
                     _activeDocument.value = savedItem
+                    _annotations.value = emptyList()
 
                     com.example.util.NotificationHelper.showPdfReadyNotification(
                         getApplication(),

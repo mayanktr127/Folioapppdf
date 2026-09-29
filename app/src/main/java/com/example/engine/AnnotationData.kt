@@ -45,9 +45,12 @@ data class PdfTextBlock(
     val rect: RectFData, // Normalized coordinates (0f..1f)
     val fontSize: Float = 14f,
     val isBold: Boolean = false,
+    val fontFamily: String = "Helvetica",
     val textColor: Int = android.graphics.Color.parseColor("#182230"),
     val backgroundColor: Int = android.graphics.Color.WHITE,
-    val isModified: Boolean = false
+    val isModified: Boolean = false,
+    val isCentered: Boolean = false,
+    val baselineY: Float? = null
 )
 
 data class PdfTextMatch(
@@ -72,7 +75,12 @@ data class AnnotationData(
     val color: Int = android.graphics.Color.RED,
     val strokeWidth: Float = 4f,
     val opacity: Float = 1.0f,
-    val signatureBitmap: Bitmap? = null
+    val signatureBitmap: Bitmap? = null,
+    val fontFamily: String = "Helvetica",
+    val fontSize: Float = 14f,
+    val isCentered: Boolean = false,
+    val baselineY: Float? = null,
+    val backgroundColor: Int? = null
 )
 
 enum class CompressionPreset(val title: String, val description: String, val scale: Float, val jpegQuality: Int) {

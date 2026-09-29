@@ -8,6 +8,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,10 +23,13 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
@@ -58,8 +62,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,9 +73,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
@@ -81,7 +90,10 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -136,10 +148,47 @@ fun EditorScreen(
     var showAssistantSheet by remember { mutableStateOf(false) }
     var isOverlayEditMode by remember { mutableStateOf(false) }
 
-    // Text Editing states
-    var selectedBlockToEdit by remember { mutableStateOf<PdfTextBlock?>(null) }
+    // Text Editing states (Inline WYSIWYG)
+    var inlineEditingBlock by remember { mutableStateOf<PdfTextBlock?>(null) }
+    var inlineEditText by remember { mutableStateOf("") }
+    var inlineFontFamily by remember { mutableStateOf("Helvetica") }
+    var inlineFontSize by remember { mutableFloatStateOf(14f) }
+    var inlineIsBold by remember { mutableStateOf(false) }
+    var inlineTextColor by remember { mutableIntStateOf(android.graphics.Color.parseColor("#182230")) }
+    val inlineFocusRequester = remember { FocusRequester() }
     var showFindReplaceDialog by remember { mutableStateOf(false) }
     var showTextBlocksSheet by remember { mutableStateOf(false) }
+
+    fun commitInlineEdit() {
+        inlineEditingBlock?.let { block ->
+            if (inlineEditText != block.text || inlineTextColor != block.textColor || inlineIsBold != block.isBold || inlineFontFamily != block.fontFamily || inlineFontSize != block.fontSize) {
+                viewModel.editTextInPdf(block, inlineEditText, inlineTextColor, inlineIsBold, inlineFontFamily, inlineFontSize)
+            }
+            inlineEditingBlock = null
+        }
+    }
+
+    fun startInlineEdit(block: PdfTextBlock) {
+        commitInlineEdit()
+        inlineEditingBlock = block
+        inlineEditText = block.text
+        inlineFontFamily = block.fontFamily
+        inlineFontSize = if (block.fontSize > 0f) block.fontSize else 14f
+        inlineIsBold = block.isBold
+        inlineTextColor = block.textColor
+    }
+
+    BackHandler(enabled = inlineEditingBlock != null) {
+        commitInlineEdit()
+    }
+
+    LaunchedEffect(inlineEditingBlock) {
+        if (inlineEditingBlock != null) {
+            try {
+                inlineFocusRequester.requestFocus()
+            } catch (_: Exception) {}
+        }
+    }
 
     val savedResultDoc by viewModel.savedResultDoc.collectAsState()
 
@@ -379,7 +428,7 @@ fun EditorScreen(
             contentAlignment = Alignment.Center
         ) {
             if (pageBitmap != null) {
-                Box(
+                BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(12.dp)
@@ -391,342 +440,505 @@ fun EditorScreen(
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    BoxWithConstraints(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(Color.White)
-                            .border(1.dp, BorderLight)
-                    ) {
-                        val boxW = maxWidth
-                        val boxH = maxHeight
+                    val bmp = pageBitmap
+                    if (bmp != null) {
+                        val bmpW = bmp.width.toFloat().coerceAtLeast(1f)
+                        val bmpH = bmp.height.toFloat().coerceAtLeast(1f)
+                        val pageAspect = bmpW / bmpH
+                        val containerAspect = (maxWidth.value / maxHeight.value).coerceAtLeast(0.01f)
 
-                        // 1. Rendered underlying PDF page bitmap
-                        Image(
-                            bitmap = pageBitmap!!.asImageBitmap(),
-                            contentDescription = "PDF Page",
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier.fillMaxSize()
-                        )
+                        val (pageBoxW, pageBoxH) = if (containerAspect > pageAspect) {
+                            val h = maxHeight
+                            val w = maxHeight * pageAspect
+                            w to h
+                        } else {
+                            val w = maxWidth
+                            val h = maxWidth / pageAspect
+                            w to h
+                        }
 
-                        // 2. Annotation & Replacement Text Overlay Canvas
-                        Canvas(
+                        Box(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .pointerInput(activeTool, activeColor, strokeWidth) {
-                                    if (activeTool != EditorTool.NONE && activeTool != EditorTool.EDIT_PDF_TEXT) {
-                                        detectDragGestures(
-                                            onDragStart = { offset ->
-                                                livePoints.add(offset)
-                                            },
-                                            onDrag = { change, _ ->
-                                                change.consume()
-                                                livePoints.add(change.position)
-                                            },
-                                            onDragEnd = {
-                                                if (livePoints.isNotEmpty()) {
-                                                    val normPoints = livePoints.map {
-                                                        (it.x / size.width) to (it.y / size.height)
-                                                    }
-                                                    val minX = normPoints.minOf { it.first }
-                                                    val maxX = normPoints.maxOf { it.first }
-                                                    val minY = normPoints.minOf { it.second }
-                                                    val maxY = normPoints.maxOf { it.second }
+                                .size(width = pageBoxW, height = pageBoxH)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Color.White)
+                                .border(1.dp, BorderLight)
+                        ) {
+                            // 1. Rendered underlying PDF page bitmap exactly filling bounds
+                            Image(
+                                bitmap = bmp.asImageBitmap(),
+                                contentDescription = "PDF Page",
+                                contentScale = ContentScale.FillBounds,
+                                modifier = Modifier.fillMaxSize()
+                            )
 
-                                                    when (activeTool) {
-                                                        EditorTool.INK -> {
-                                                            viewModel.addAnnotation(
-                                                                AnnotationData(
-                                                                    pageIndex = activePageIndex,
-                                                                    type = AnnotationType.INK,
-                                                                    points = normPoints,
-                                                                    color = activeColor,
-                                                                    strokeWidth = strokeWidth
-                                                                )
-                                                            )
+                            // 2. Annotation & Replacement Text Overlay Canvas
+                            Canvas(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .pointerInput(activeTool, activeColor, strokeWidth, inlineEditingBlock) {
+                                        if (inlineEditingBlock != null) {
+                                            detectTapGestures {
+                                                commitInlineEdit()
+                                            }
+                                        } else if (activeTool != EditorTool.NONE && activeTool != EditorTool.EDIT_PDF_TEXT) {
+                                            detectDragGestures(
+                                                onDragStart = { offset ->
+                                                    livePoints.add(offset)
+                                                },
+                                                onDrag = { change, _ ->
+                                                    change.consume()
+                                                    livePoints.add(change.position)
+                                                },
+                                                onDragEnd = {
+                                                    if (livePoints.isNotEmpty()) {
+                                                        val normPoints = livePoints.map {
+                                                            (it.x / size.width) to (it.y / size.height)
                                                         }
-                                                        EditorTool.HIGHLIGHT -> {
-                                                            viewModel.addAnnotation(
-                                                                AnnotationData(
-                                                                    pageIndex = activePageIndex,
-                                                                    type = AnnotationType.HIGHLIGHT,
-                                                                    rect = RectFData(minX, minY, maxX, maxY),
-                                                                    color = activeColor,
-                                                                    opacity = 0.45f
+                                                        val minX = normPoints.minOf { it.first }
+                                                        val maxX = normPoints.maxOf { it.first }
+                                                        val minY = normPoints.minOf { it.second }
+                                                        val maxY = normPoints.maxOf { it.second }
+
+                                                        when (activeTool) {
+                                                            EditorTool.INK -> {
+                                                                viewModel.addAnnotation(
+                                                                    AnnotationData(
+                                                                        pageIndex = activePageIndex,
+                                                                        type = AnnotationType.INK,
+                                                                        points = normPoints,
+                                                                        color = activeColor,
+                                                                        strokeWidth = strokeWidth
+                                                                    )
                                                                 )
-                                                            )
-                                                        }
-                                                        EditorTool.UNDERLINE -> {
-                                                            viewModel.addAnnotation(
-                                                                AnnotationData(
-                                                                    pageIndex = activePageIndex,
-                                                                    type = AnnotationType.UNDERLINE,
-                                                                    rect = RectFData(minX, minY, maxX, maxY),
-                                                                    color = activeColor
+                                                            }
+                                                            EditorTool.HIGHLIGHT -> {
+                                                                viewModel.addAnnotation(
+                                                                    AnnotationData(
+                                                                        pageIndex = activePageIndex,
+                                                                        type = AnnotationType.HIGHLIGHT,
+                                                                        rect = RectFData(minX, minY, maxX, maxY),
+                                                                        color = activeColor,
+                                                                        opacity = 0.45f
+                                                                    )
                                                                 )
-                                                            )
-                                                        }
-                                                        EditorTool.STRIKETHROUGH -> {
-                                                            viewModel.addAnnotation(
-                                                                AnnotationData(
-                                                                    pageIndex = activePageIndex,
-                                                                    type = AnnotationType.STRIKETHROUGH,
-                                                                    rect = RectFData(minX, minY, maxX, maxY),
-                                                                    color = activeColor
+                                                            }
+                                                            EditorTool.UNDERLINE -> {
+                                                                viewModel.addAnnotation(
+                                                                    AnnotationData(
+                                                                        pageIndex = activePageIndex,
+                                                                        type = AnnotationType.UNDERLINE,
+                                                                        rect = RectFData(minX, minY, maxX, maxY),
+                                                                        color = activeColor
+                                                                    )
                                                                 )
-                                                            )
-                                                        }
-                                                        EditorTool.RECTANGLE -> {
-                                                            viewModel.addAnnotation(
-                                                                AnnotationData(
-                                                                    pageIndex = activePageIndex,
-                                                                    type = AnnotationType.RECTANGLE,
-                                                                    rect = RectFData(minX, minY, maxX, maxY),
-                                                                    color = activeColor,
-                                                                    strokeWidth = strokeWidth
+                                                            }
+                                                            EditorTool.STRIKETHROUGH -> {
+                                                                viewModel.addAnnotation(
+                                                                    AnnotationData(
+                                                                        pageIndex = activePageIndex,
+                                                                        type = AnnotationType.STRIKETHROUGH,
+                                                                        rect = RectFData(minX, minY, maxX, maxY),
+                                                                        color = activeColor
+                                                                    )
                                                                 )
-                                                            )
-                                                        }
-                                                        EditorTool.CIRCLE -> {
-                                                            viewModel.addAnnotation(
-                                                                AnnotationData(
-                                                                    pageIndex = activePageIndex,
-                                                                    type = AnnotationType.CIRCLE,
-                                                                    rect = RectFData(minX, minY, maxX, maxY),
-                                                                    color = activeColor,
-                                                                    strokeWidth = strokeWidth
+                                                            }
+                                                            EditorTool.RECTANGLE -> {
+                                                                viewModel.addAnnotation(
+                                                                    AnnotationData(
+                                                                        pageIndex = activePageIndex,
+                                                                        type = AnnotationType.RECTANGLE,
+                                                                        rect = RectFData(minX, minY, maxX, maxY),
+                                                                        color = activeColor,
+                                                                        strokeWidth = strokeWidth
+                                                                    )
                                                                 )
-                                                            )
-                                                        }
-                                                        EditorTool.REDACT -> {
-                                                            viewModel.addAnnotation(
-                                                                AnnotationData(
-                                                                    pageIndex = activePageIndex,
-                                                                    type = AnnotationType.REDACTION,
-                                                                    rect = RectFData(minX, minY, maxX, maxY),
-                                                                    color = android.graphics.Color.BLACK
+                                                            }
+                                                            EditorTool.CIRCLE -> {
+                                                                viewModel.addAnnotation(
+                                                                    AnnotationData(
+                                                                        pageIndex = activePageIndex,
+                                                                        type = AnnotationType.CIRCLE,
+                                                                        rect = RectFData(minX, minY, maxX, maxY),
+                                                                        color = activeColor,
+                                                                        strokeWidth = strokeWidth
+                                                                    )
                                                                 )
-                                                            )
+                                                            }
+                                                            EditorTool.REDACT -> {
+                                                                viewModel.addAnnotation(
+                                                                    AnnotationData(
+                                                                        pageIndex = activePageIndex,
+                                                                        type = AnnotationType.REDACTION,
+                                                                        rect = RectFData(minX, minY, maxX, maxY),
+                                                                        color = android.graphics.Color.BLACK
+                                                                    )
+                                                                )
+                                                            }
+                                                            else -> {}
                                                         }
-                                                        else -> {}
+                                                        livePoints.clear()
                                                     }
+                                                },
+                                                onDragCancel = {
                                                     livePoints.clear()
                                                 }
-                                            },
-                                            onDragCancel = {
-                                                livePoints.clear()
+                                            )
+                                        }
+                                    }
+                            ) {
+                                val w = size.width
+                                val h = size.height
+
+                                // Draw saved annotations for active page
+                                for (annot in annotations.filter { it.pageIndex == activePageIndex }) {
+                                    when (annot.type) {
+                                        AnnotationType.INK -> {
+                                            if (annot.points.size > 1) {
+                                                val path = Path()
+                                                path.moveTo(annot.points[0].first * w, annot.points[0].second * h)
+                                                for (i in 1 until annot.points.size) {
+                                                    path.lineTo(annot.points[i].first * w, annot.points[i].second * h)
+                                                }
+                                                drawPath(
+                                                    path = path,
+                                                    color = Color(annot.color),
+                                                    style = Stroke(
+                                                        width = annot.strokeWidth,
+                                                        cap = StrokeCap.Round,
+                                                        join = StrokeJoin.Round
+                                                    )
+                                                )
                                             }
+                                        }
+                                        AnnotationType.HIGHLIGHT -> {
+                                            annot.rect?.let { r ->
+                                                drawRect(
+                                                    color = Color(annot.color).copy(alpha = 0.4f),
+                                                    topLeft = Offset(r.left * w, r.top * h),
+                                                    size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h)
+                                                )
+                                            }
+                                        }
+                                        AnnotationType.UNDERLINE -> {
+                                            annot.rect?.let { r ->
+                                                drawLine(
+                                                    color = Color(annot.color),
+                                                    start = Offset(r.left * w, r.bottom * h),
+                                                    end = Offset(r.right * w, r.bottom * h),
+                                                    strokeWidth = 3f
+                                                )
+                                            }
+                                        }
+                                        AnnotationType.STRIKETHROUGH -> {
+                                            annot.rect?.let { r ->
+                                                val midY = (r.top + r.bottom) / 2f * h
+                                                drawLine(
+                                                    color = Color(annot.color),
+                                                    start = Offset(r.left * w, midY),
+                                                    end = Offset(r.right * w, midY),
+                                                    strokeWidth = 3f
+                                                )
+                                            }
+                                        }
+                                        AnnotationType.RECTANGLE -> {
+                                            annot.rect?.let { r ->
+                                                drawRect(
+                                                    color = Color(annot.color),
+                                                    topLeft = Offset(r.left * w, r.top * h),
+                                                    size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h),
+                                                    style = Stroke(width = annot.strokeWidth)
+                                                )
+                                            }
+                                        }
+                                        AnnotationType.CIRCLE -> {
+                                            annot.rect?.let { r ->
+                                                drawOval(
+                                                    color = Color(annot.color),
+                                                    topLeft = Offset(r.left * w, r.top * h),
+                                                    size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h),
+                                                    style = Stroke(width = annot.strokeWidth)
+                                                )
+                                            }
+                                        }
+                                        AnnotationType.REDACTION -> {
+                                            annot.rect?.let { r ->
+                                                drawRect(
+                                                    color = Color.Black,
+                                                    topLeft = Offset(r.left * w, r.top * h),
+                                                    size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h)
+                                                )
+                                            }
+                                        }
+                                        AnnotationType.TEXT_REPLACE, AnnotationType.OVERLAY_EDIT -> {
+                                            annot.rect?.let { r ->
+                                                val leftPx = r.left * w
+                                                val topPx = r.top * h
+                                                val rightPx = r.right * w
+                                                val bottomPx = r.bottom * h
+
+                                                var bgColor = annot.backgroundColor ?: Color.White.toArgb()
+                                                if (pageBitmap != null && !pageBitmap!!.isRecycled && (annot.backgroundColor == null || annot.backgroundColor == Color.White.toArgb())) {
+                                                    try {
+                                                        val bmpX = ((r.left * pageBitmap!!.width).toInt() + 2).coerceIn(0, pageBitmap!!.width - 1)
+                                                        val bmpY = ((r.top * pageBitmap!!.height).toInt() - 2).coerceIn(0, pageBitmap!!.height - 1)
+                                                        val sampledPixel = pageBitmap!!.getPixel(bmpX, bmpY)
+                                                        val red = android.graphics.Color.red(sampledPixel)
+                                                        val green = android.graphics.Color.green(sampledPixel)
+                                                        val blue = android.graphics.Color.blue(sampledPixel)
+                                                        val lum = (0.299f * red + 0.587f * green + 0.114f * blue) / 255f
+                                                        if (lum > 0.20f) {
+                                                            bgColor = sampledPixel
+                                                        }
+                                                    } catch (_: Exception) {}
+                                                }
+
+                                                val padX = 1f
+                                                val padY = 1f
+                                                drawRect(
+                                                    color = Color(bgColor),
+                                                    topLeft = Offset((leftPx - padX).coerceAtLeast(0f), (topPx - padY).coerceAtLeast(0f)),
+                                                    size = androidx.compose.ui.geometry.Size(
+                                                        (rightPx - leftPx + padX * 2).coerceAtMost(w - leftPx),
+                                                        (bottomPx - topPx + padY * 2).coerceAtMost(h - topPx)
+                                                    )
+                                                )
+                                                if (!annot.text.isNullOrBlank()) {
+                                                    val isCentered = annot.isCentered
+                                                    val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                        color = annot.color
+                                                        val estimatedSize = if (annot.fontSize > 0f) {
+                                                            annot.fontSize * (h / 842f)
+                                                        } else {
+                                                            kotlin.math.max(11f, r.height * h * 0.76f)
+                                                        }
+                                                        textSize = estimatedSize
+                                                        isFakeBoldText = annot.strokeWidth > 1.2f
+                                                        textAlign = if (isCentered) android.graphics.Paint.Align.CENTER else android.graphics.Paint.Align.LEFT
+                                                        typeface = when (annot.fontFamily.lowercase()) {
+                                                            "serif", "times", "times new roman" -> if (annot.strokeWidth > 1.2f) android.graphics.Typeface.create(android.graphics.Typeface.SERIF, android.graphics.Typeface.BOLD) else android.graphics.Typeface.SERIF
+                                                            "monospace", "courier", "courier new" -> if (annot.strokeWidth > 1.2f) android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD) else android.graphics.Typeface.MONOSPACE
+                                                            else -> if (annot.strokeWidth > 1.2f) android.graphics.Typeface.DEFAULT_BOLD else android.graphics.Typeface.DEFAULT
+                                                        }
+                                                    }
+
+                                                    val availableWidth = (rightPx - leftPx)
+                                                    val measuredWidth = paint.measureText(annot.text)
+                                                    if (measuredWidth > availableWidth && availableWidth > 50f) {
+                                                        val scaleRatio = availableWidth / measuredWidth
+                                                        if (scaleRatio >= 0.90f) {
+                                                            paint.textScaleX = scaleRatio
+                                                        }
+                                                    }
+
+                                                    val baseline = if (annot.baselineY != null) {
+                                                        annot.baselineY * h
+                                                    } else {
+                                                        bottomPx - (bottomPx - topPx) * 0.18f
+                                                    }
+                                                    val posX = if (isCentered) (leftPx + rightPx) / 2f else leftPx
+                                                    drawContext.canvas.nativeCanvas.drawText(
+                                                        annot.text,
+                                                        posX,
+                                                        baseline,
+                                                        paint
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        AnnotationType.TEXT -> {
+                                            annot.rect?.let { r ->
+                                                if (!annot.text.isNullOrBlank()) {
+                                                    val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                        color = annot.color
+                                                        textSize = kotlin.math.max(16f, r.height * h * 0.72f)
+                                                        isFakeBoldText = annot.strokeWidth > 1f
+                                                    }
+                                                    val baseline = (r.bottom * h) - (r.height * h * 0.18f)
+                                                    drawContext.canvas.nativeCanvas.drawText(
+                                                        annot.text,
+                                                        r.left * w,
+                                                        baseline,
+                                                        paint
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        AnnotationType.SIGNATURE -> {
+                                            annot.rect?.let { r ->
+                                                annot.signatureBitmap?.let { sigBmp ->
+                                                    drawImage(
+                                                        image = sigBmp.asImageBitmap(),
+                                                        dstOffset = androidx.compose.ui.unit.IntOffset((r.left * w).toInt(), (r.top * h).toInt()),
+                                                        dstSize = androidx.compose.ui.unit.IntSize((r.width * w).toInt(), (r.height * h).toInt())
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        AnnotationType.WATERMARK -> {
+                                            annot.text?.let { text ->
+                                                val wmPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    color = android.graphics.Color.parseColor("#44D52B49")
+                                                    textSize = w * 0.08f
+                                                    isFakeBoldText = true
+                                                    textAlign = android.graphics.Paint.Align.CENTER
+                                                }
+                                                drawContext.canvas.nativeCanvas.save()
+                                                drawContext.canvas.nativeCanvas.rotate(-45f, w / 2f, h / 2f)
+                                                drawContext.canvas.nativeCanvas.drawText(text, w / 2f, h / 2f, wmPaint)
+                                                drawContext.canvas.nativeCanvas.restore()
+                                            }
+                                        }
+                                        AnnotationType.PAGE_NUMBER -> {
+                                            annot.text?.let { numStr ->
+                                                val numPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                                    color = android.graphics.Color.DKGRAY
+                                                    textSize = 22f
+                                                    textAlign = android.graphics.Paint.Align.CENTER
+                                                }
+                                                drawContext.canvas.nativeCanvas.drawText(numStr, w / 2f, h - 28f, numPaint)
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // While inline editing, mask the underlying text on canvas
+                                inlineEditingBlock?.let { block ->
+                                    val r = block.rect
+                                    val leftPx = r.left * w
+                                    val topPx = r.top * h
+                                    val rightPx = r.right * w
+                                    val bottomPx = r.bottom * h
+                                    val padX = 1f
+                                    val padY = 1f
+                                    var maskColor = block.backgroundColor
+                                    if (pageBitmap != null && !pageBitmap!!.isRecycled && maskColor == android.graphics.Color.WHITE) {
+                                        try {
+                                            val bmpX = ((r.left * pageBitmap!!.width).toInt() + 2).coerceIn(0, pageBitmap!!.width - 1)
+                                            val bmpY = ((r.top * pageBitmap!!.height).toInt() - 2).coerceIn(0, pageBitmap!!.height - 1)
+                                            maskColor = pageBitmap!!.getPixel(bmpX, bmpY)
+                                        } catch (_: Exception) {}
+                                    }
+                                    drawRect(
+                                        color = Color(maskColor),
+                                        topLeft = Offset((leftPx - padX).coerceAtLeast(0f), (topPx - padY).coerceAtLeast(0f)),
+                                        size = androidx.compose.ui.geometry.Size(
+                                            (rightPx - leftPx + padX * 2).coerceAtMost(w - leftPx),
+                                            (bottomPx - topPx + padY * 2).coerceAtMost(h - topPx)
+                                        )
+                                    )
+                                }
+
+                                // Draw currently active drag stroke
+                                if (livePoints.size > 1) {
+                                    val path = Path()
+                                    path.moveTo(livePoints[0].x, livePoints[0].y)
+                                    for (i in 1 until livePoints.size) {
+                                        path.lineTo(livePoints[i].x, livePoints[i].y)
+                                    }
+                                    drawPath(
+                                        path = path,
+                                        color = Color(activeColor),
+                                        style = Stroke(
+                                            width = strokeWidth,
+                                            cap = StrokeCap.Round,
+                                            join = StrokeJoin.Round
+                                        )
+                                    )
+                                }
+                            }
+
+                            // 3. Interactive Text Blocks Overlay (When EDIT_PDF_TEXT mode is active)
+                            if (activeTool == EditorTool.EDIT_PDF_TEXT) {
+                                textBlocks.forEach { block ->
+                                    val isEditing = inlineEditingBlock?.id == block.id
+                                    if (!isEditing) {
+                                        val leftOffset = pageBoxW * block.rect.left
+                                        val topOffset = pageBoxH * block.rect.top
+                                        val blockW = (pageBoxW * block.rect.width).coerceAtLeast(40.dp)
+                                        val blockH = (pageBoxH * block.rect.height).coerceAtLeast(20.dp)
+
+                                        Box(
+                                            modifier = Modifier
+                                                .offset(x = leftOffset, y = topOffset)
+                                                .size(width = blockW, height = blockH)
+                                                .border(
+                                                    width = 1.dp,
+                                                    color = if (block.isModified) CranberryPrimary else Color(0xFF2563EB).copy(alpha = 0.65f),
+                                                    shape = RoundedCornerShape(2.dp)
+                                                )
+                                                .background(
+                                                    if (block.isModified) CranberryPale.copy(alpha = 0.25f) else Color(0xFF2563EB).copy(alpha = 0.08f)
+                                                )
+                                                .clickable {
+                                                    startInlineEdit(block)
+                                                }
+                                                .testTag("text_block_${block.id}")
                                         )
                                     }
                                 }
-                        ) {
-                            val w = size.width
-                            val h = size.height
-
-                            // Draw saved annotations for active page
-                            for (annot in annotations.filter { it.pageIndex == activePageIndex }) {
-                                when (annot.type) {
-                                    AnnotationType.INK -> {
-                                        if (annot.points.size > 1) {
-                                            val path = Path()
-                                            path.moveTo(annot.points[0].first * w, annot.points[0].second * h)
-                                            for (i in 1 until annot.points.size) {
-                                                path.lineTo(annot.points[i].first * w, annot.points[i].second * h)
-                                            }
-                                            drawPath(
-                                                path = path,
-                                                color = Color(annot.color),
-                                                style = Stroke(
-                                                    width = annot.strokeWidth,
-                                                    cap = StrokeCap.Round,
-                                                    join = StrokeJoin.Round
-                                                )
-                                            )
-                                        }
-                                    }
-                                    AnnotationType.HIGHLIGHT -> {
-                                        annot.rect?.let { r ->
-                                            drawRect(
-                                                color = Color(annot.color).copy(alpha = 0.4f),
-                                                topLeft = Offset(r.left * w, r.top * h),
-                                                size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h)
-                                            )
-                                        }
-                                    }
-                                    AnnotationType.UNDERLINE -> {
-                                        annot.rect?.let { r ->
-                                            drawLine(
-                                                color = Color(annot.color),
-                                                start = Offset(r.left * w, r.bottom * h),
-                                                end = Offset(r.right * w, r.bottom * h),
-                                                strokeWidth = 3f
-                                            )
-                                        }
-                                    }
-                                    AnnotationType.STRIKETHROUGH -> {
-                                        annot.rect?.let { r ->
-                                            val midY = (r.top + r.bottom) / 2f * h
-                                            drawLine(
-                                                color = Color(annot.color),
-                                                start = Offset(r.left * w, midY),
-                                                end = Offset(r.right * w, midY),
-                                                strokeWidth = 3f
-                                            )
-                                        }
-                                    }
-                                    AnnotationType.RECTANGLE -> {
-                                        annot.rect?.let { r ->
-                                            drawRect(
-                                                color = Color(annot.color),
-                                                topLeft = Offset(r.left * w, r.top * h),
-                                                size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h),
-                                                style = Stroke(width = annot.strokeWidth)
-                                            )
-                                        }
-                                    }
-                                    AnnotationType.CIRCLE -> {
-                                        annot.rect?.let { r ->
-                                            drawOval(
-                                                color = Color(annot.color),
-                                                topLeft = Offset(r.left * w, r.top * h),
-                                                size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h),
-                                                style = Stroke(width = annot.strokeWidth)
-                                            )
-                                        }
-                                    }
-                                    AnnotationType.REDACTION -> {
-                                        annot.rect?.let { r ->
-                                            drawRect(
-                                                color = Color.Black,
-                                                topLeft = Offset(r.left * w, r.top * h),
-                                                size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h)
-                                            )
-                                        }
-                                    }
-                                    AnnotationType.TEXT_REPLACE, AnnotationType.OVERLAY_EDIT -> {
-                                        annot.rect?.let { r ->
-                                            // 1. Cover original text with solid white
-                                            drawRect(
-                                                color = Color.White,
-                                                topLeft = Offset(r.left * w, r.top * h),
-                                                size = androidx.compose.ui.geometry.Size(r.width * w, r.height * h)
-                                            )
-                                            // 2. Draw replacement text in place
-                                            if (!annot.text.isNullOrBlank()) {
-                                                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                                                    color = annot.color
-                                                    textSize = kotlin.math.max(16f, r.height * h * 0.72f)
-                                                    isFakeBoldText = annot.strokeWidth > 1f
-                                                }
-                                                val baseline = (r.bottom * h) - (r.height * h * 0.18f)
-                                                drawContext.canvas.nativeCanvas.drawText(
-                                                    annot.text,
-                                                    r.left * w,
-                                                    baseline,
-                                                    paint
-                                                )
-                                            }
-                                        }
-                                    }
-                                    AnnotationType.TEXT -> {
-                                        annot.rect?.let { r ->
-                                            if (!annot.text.isNullOrBlank()) {
-                                                val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                                                    color = annot.color
-                                                    textSize = kotlin.math.max(16f, r.height * h * 0.72f)
-                                                    isFakeBoldText = annot.strokeWidth > 1f
-                                                }
-                                                val baseline = (r.bottom * h) - (r.height * h * 0.18f)
-                                                drawContext.canvas.nativeCanvas.drawText(
-                                                    annot.text,
-                                                    r.left * w,
-                                                    baseline,
-                                                    paint
-                                                )
-                                            }
-                                        }
-                                    }
-                                    AnnotationType.SIGNATURE -> {
-                                        annot.rect?.let { r ->
-                                            annot.signatureBitmap?.let { sigBmp ->
-                                                drawImage(
-                                                    image = sigBmp.asImageBitmap(),
-                                                    dstOffset = androidx.compose.ui.unit.IntOffset((r.left * w).toInt(), (r.top * h).toInt()),
-                                                    dstSize = androidx.compose.ui.unit.IntSize((r.width * w).toInt(), (r.height * h).toInt())
-                                                )
-                                            }
-                                        }
-                                    }
-                                    AnnotationType.WATERMARK -> {
-                                        annot.text?.let { text ->
-                                            val wmPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                                                color = android.graphics.Color.parseColor("#44D52B49")
-                                                textSize = w * 0.08f
-                                                isFakeBoldText = true
-                                                textAlign = android.graphics.Paint.Align.CENTER
-                                            }
-                                            drawContext.canvas.nativeCanvas.save()
-                                            drawContext.canvas.nativeCanvas.rotate(-45f, w / 2f, h / 2f)
-                                            drawContext.canvas.nativeCanvas.drawText(text, w / 2f, h / 2f, wmPaint)
-                                            drawContext.canvas.nativeCanvas.restore()
-                                        }
-                                    }
-                                    AnnotationType.PAGE_NUMBER -> {
-                                        annot.text?.let { numStr ->
-                                            val numPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                                                color = android.graphics.Color.DKGRAY
-                                                textSize = 22f
-                                                textAlign = android.graphics.Paint.Align.CENTER
-                                            }
-                                            drawContext.canvas.nativeCanvas.drawText(numStr, w / 2f, h - 28f, numPaint)
-                                        }
-                                    }
-                                }
                             }
 
-                            // Draw currently active drag stroke
-                            if (livePoints.size > 1) {
-                                val path = Path()
-                                path.moveTo(livePoints[0].x, livePoints[0].y)
-                                for (i in 1 until livePoints.size) {
-                                    path.lineTo(livePoints[i].x, livePoints[i].y)
-                                }
-                                drawPath(
-                                    path = path,
-                                    color = Color(activeColor),
-                                    style = Stroke(
-                                        width = strokeWidth,
-                                        cap = StrokeCap.Round,
-                                        join = StrokeJoin.Round
-                                    )
-                                )
-                            }
-                        }
+                            // 4. Live Inline WYSIWYG Editor Field & Floating Toolbar
+                            inlineEditingBlock?.let { block ->
+                                val leftOffset = pageBoxW * block.rect.left
+                                val topOffset = pageBoxH * block.rect.top
+                                val blockW = (pageBoxW * block.rect.width).coerceAtLeast(50.dp)
+                                val blockH = (pageBoxH * block.rect.height).coerceAtLeast(22.dp)
+                                val maxFieldW = (pageBoxW - leftOffset - 4.dp).coerceAtLeast(blockW)
+                                val isCentered = block.isCentered
 
-                        // 3. Interactive Text Blocks Overlay (When EDIT_PDF_TEXT mode is active)
-                        if (activeTool == EditorTool.EDIT_PDF_TEXT) {
-                            textBlocks.forEach { block ->
-                                val leftOffset = boxW * block.rect.left
-                                val topOffset = boxH * block.rect.top
-                                val blockW = (boxW * block.rect.width).coerceAtLeast(40.dp)
-                                val blockH = (boxH * block.rect.height).coerceAtLeast(24.dp)
-
+                                // Live editable field right on the line with matching background color
                                 Box(
                                     modifier = Modifier
                                         .offset(x = leftOffset, y = topOffset)
-                                        .size(width = blockW, height = blockH)
-                                        .border(
-                                            width = 1.5.dp,
-                                            color = if (block.isModified) CranberryPrimary else Color(0xFF2563EB).copy(alpha = 0.75f),
-                                            shape = RoundedCornerShape(2.dp)
-                                        )
-                                        .background(
-                                            if (block.isModified) CranberryPale.copy(alpha = 0.35f) else Color(0xFF2563EB).copy(alpha = 0.12f)
-                                        )
-                                        .clickable {
-                                            selectedBlockToEdit = block
-                                        }
-                                        .testTag("text_block_${block.id}")
+                                        .sizeIn(minWidth = blockW, minHeight = blockH, maxWidth = maxFieldW)
+                                        .background(Color(block.backgroundColor))
+                                        .border(1.5.dp, CranberryPrimary.copy(alpha = 0.8f), RoundedCornerShape(2.dp))
+                                        .padding(horizontal = 2.dp, vertical = 1.dp)
+                                ) {
+                                    BasicTextField(
+                                        value = inlineEditText,
+                                        onValueChange = { inlineEditText = it },
+                                        textStyle = TextStyle(
+                                            color = Color(inlineTextColor),
+                                            fontSize = (inlineFontSize * (pageBoxH.value / 842f)).sp,
+                                            fontWeight = if (inlineIsBold) FontWeight.Bold else FontWeight.Normal,
+                                            fontFamily = when (inlineFontFamily.lowercase()) {
+                                                "serif", "times", "times new roman" -> FontFamily.Serif
+                                                "monospace", "courier", "courier new" -> FontFamily.Monospace
+                                                else -> FontFamily.Default
+                                            },
+                                            textAlign = if (isCentered) TextAlign.Center else TextAlign.Start
+                                        ),
+                                        cursorBrush = SolidColor(CranberryPrimary),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .focusRequester(inlineFocusRequester)
+                                            .testTag("inline_edit_textfield")
+                                    )
+                                }
+
+                                // Floating compact toolbar positioned just above the line (or below if near top)
+                                val toolbarH = 42.dp
+                                val toolbarY = if (topOffset > 48.dp) (topOffset - toolbarH - 6.dp) else (topOffset + blockH + 6.dp)
+                                val toolbarX = leftOffset.coerceIn(4.dp, (pageBoxW - 320.dp).coerceAtLeast(4.dp))
+
+                                InlineTextToolbar(
+                                    currentFont = inlineFontFamily,
+                                    currentSize = inlineFontSize,
+                                    isBold = inlineIsBold,
+                                    currentColor = inlineTextColor,
+                                    onFontChange = { inlineFontFamily = it },
+                                    onSizeChange = { inlineFontSize = it },
+                                    onBoldToggle = { inlineIsBold = !inlineIsBold },
+                                    onColorChange = { inlineTextColor = it },
+                                    onDone = { commitInlineEdit() },
+                                    onDelete = {
+                                        viewModel.deleteTextInPdf(block)
+                                        inlineEditingBlock = null
+                                    },
+                                    modifier = Modifier.offset(x = toolbarX, y = toolbarY)
                                 )
                             }
                         }
@@ -908,26 +1120,6 @@ fun EditorScreen(
         }
     }
 
-    // Edit Document Text Dialog
-    selectedBlockToEdit?.let { block ->
-        EditDocumentTextDialog(
-            block = block,
-            onDismiss = { selectedBlockToEdit = null },
-            onApply = { newText, color, isBold ->
-                viewModel.editTextInPdf(block, newText, color, isBold)
-                selectedBlockToEdit = null
-            },
-            onDelete = {
-                viewModel.deleteTextInPdf(block)
-                selectedBlockToEdit = null
-            },
-            onFindAndReplaceAll = { find, replace ->
-                viewModel.executeFindAndReplace(find, replace, isEntireDoc = true)
-                selectedBlockToEdit = null
-            }
-        )
-    }
-
     // Find and Replace Dialog
     if (showFindReplaceDialog) {
         FindAndReplaceDialog(
@@ -948,7 +1140,11 @@ fun EditorScreen(
             textBlocks = textBlocks,
             onDismiss = { showTextBlocksSheet = false },
             onSelectBlock = { block ->
-                selectedBlockToEdit = block
+                showTextBlocksSheet = false
+                if (activeTool != EditorTool.EDIT_PDF_TEXT) {
+                    viewModel.setEditorTool(EditorTool.EDIT_PDF_TEXT)
+                }
+                startInlineEdit(block)
             },
             onAddNewText = {
                 isOverlayEditMode = false
