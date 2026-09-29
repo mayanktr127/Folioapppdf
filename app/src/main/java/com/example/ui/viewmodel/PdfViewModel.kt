@@ -206,6 +206,16 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     private val _savedResultDoc = MutableStateFlow<Pair<PdfDocumentItem, PdfDocumentItem?>?>(null)
     val savedResultDoc = _savedResultDoc.asStateFlow()
 
+    // In-Document Search & Replace State
+    private val _docSearchQuery = MutableStateFlow("")
+    val docSearchQuery = _docSearchQuery.asStateFlow()
+
+    private val _searchMatches = MutableStateFlow<List<com.example.engine.PdfTextMatch>>(emptyList())
+    val searchMatches = _searchMatches.asStateFlow()
+
+    private val _isSearching = MutableStateFlow(false)
+    val isSearching = _isSearching.asStateFlow()
+
     private val _notificationsEnabled = MutableStateFlow(true)
     val notificationsEnabled = _notificationsEnabled.asStateFlow()
 
@@ -522,6 +532,150 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             _isProcessing.value = false
             _statusMessage.value = "Replaced $totalMatches match(es) across document"
         }
+    }
+
+    fun searchInDocument(query: String) {
+        _docSearchQuery.value = query
+        val state = _docState.value ?: return
+        if (query.isBlank()) {
+            _searchMatches.value = emptyList()
+            return
+        }
+
+        viewModelScope.launch {
+            _isSearching.value = true
+            val matches = PdfEngine.searchAllPages(state.sourceFile, state.pages, query)
+            _searchMatches.value = matches
+            _isSearching.value = false
+        }
+    }
+
+    fun replaceSingleOccurrence(match: com.example.engine.PdfTextMatch, replacement: String) {
+        val state = _docState.value ?: return
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        val pageIdx = match.pageIndex
+        if (pageIdx !in state.pages.indices) return
+        val pageState = state.pages[pageIdx]
+
+        val newText = match.lineText.replace(match.matchedWord, replacement, ignoreCase = true)
+        val annot = AnnotationData(
+            pageIndex = pageIdx,
+            type = AnnotationType.TEXT_REPLACE,
+            rect = match.blockRect,
+            text = newText,
+            originalText = match.lineText
+        )
+
+        val updatedAnnots = pageState.annotations.filterNot {
+            it.rect == match.blockRect && it.type == AnnotationType.TEXT_REPLACE
+        } + annot
+
+        val updatedBlocks = pageState.textBlocks.map { b ->
+            if (b.rect == match.blockRect || b.id == match.textBlockId) {
+                b.copy(text = newText, isModified = true)
+            } else b
+        }
+
+        val updatedPages = state.pages.toMutableList()
+        updatedPages[pageIdx] = pageState.copy(
+            annotations = updatedAnnots,
+            textBlocks = updatedBlocks
+        )
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        _searchMatches.value = _searchMatches.value.filterNot { it.matchId == match.matchId }
+
+        viewModelScope.launch {
+            if (_activePageIndex.value != pageIdx) {
+                _activePageIndex.value = pageIdx
+            }
+            loadActivePage()
+        }
+        _statusMessage.value = "Replaced match on Page ${pageIdx + 1}"
+    }
+
+    fun replaceOnPage(pageIdx: Int, query: String, replacement: String) {
+        val state = _docState.value ?: return
+        if (pageIdx !in state.pages.indices || query.isBlank()) return
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        val pageState = state.pages[pageIdx]
+        val blocks = if (pageState.textBlocks.isNotEmpty()) {
+            pageState.textBlocks
+        } else {
+            pageState.textBlocks
+        }
+
+        val newAnnots = pageState.annotations.toMutableList()
+        var count = 0
+        val updatedBlocks = blocks.map { b ->
+            if (b.text.contains(query, ignoreCase = true)) {
+                count++
+                val replaced = b.text.replace(query, replacement, ignoreCase = true)
+                newAnnots.removeAll { it.rect == b.rect && it.type == AnnotationType.TEXT_REPLACE }
+                newAnnots.add(
+                    AnnotationData(
+                        pageIndex = pageIdx,
+                        type = AnnotationType.TEXT_REPLACE,
+                        rect = b.rect,
+                        text = replaced,
+                        originalText = b.originalText
+                    )
+                )
+                b.copy(text = replaced, isModified = true)
+            } else b
+        }
+
+        val updatedPages = state.pages.toMutableList()
+        updatedPages[pageIdx] = pageState.copy(
+            annotations = newAnnots,
+            textBlocks = updatedBlocks
+        )
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        _searchMatches.value = _searchMatches.value.filterNot { it.pageIndex == pageIdx }
+
+        viewModelScope.launch {
+            if (_activePageIndex.value != pageIdx) {
+                _activePageIndex.value = pageIdx
+            }
+            loadActivePage()
+        }
+        _statusMessage.value = "Replaced $count match(es) on Page ${pageIdx + 1}"
+    }
+
+    fun replaceAllInDocument(query: String, replacement: String) {
+        executeFindAndReplace(query, replacement, isEntireDoc = true)
+        _searchMatches.value = emptyList()
+    }
+
+    fun addRedactions(redactions: List<Pair<com.example.engine.RectFData, Int>>) {
+        val state = _docState.value ?: return
+        if (redactions.isEmpty()) return
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        val pageIdx = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
+        val pageState = state.pages[pageIdx]
+
+        val newAnnots = redactions.map { (rect, color) ->
+            AnnotationData(
+                pageIndex = pageIdx,
+                type = AnnotationType.REDACTION,
+                rect = rect,
+                color = color
+            )
+        }
+
+        val updatedPages = state.pages.toMutableList()
+        updatedPages[pageIdx] = pageState.copy(annotations = pageState.annotations + newAnnots)
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        _annotations.value = updatedPages[pageIdx].annotations
+        _statusMessage.value = "Applied ${redactions.size} redaction(s) on Page ${pageIdx + 1}"
     }
 
     fun updateDocumentPages(newPages: List<FolioPageState>) {

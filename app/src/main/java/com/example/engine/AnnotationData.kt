@@ -50,6 +50,17 @@ data class PdfTextBlock(
     val isModified: Boolean = false
 )
 
+data class PdfTextMatch(
+    val matchId: String = java.util.UUID.randomUUID().toString(),
+    val pageIndex: Int, // 0-based page index in document state
+    val originalPageIndex: Int,
+    val lineIndex: Int = 0,
+    val lineText: String,
+    val blockRect: RectFData,
+    val matchedWord: String,
+    val textBlockId: String? = null
+)
+
 data class AnnotationData(
     val id: String = java.util.UUID.randomUUID().toString(),
     val pageIndex: Int,

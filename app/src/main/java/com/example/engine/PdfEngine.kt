@@ -744,11 +744,38 @@ object PdfEngine {
             }
             AnnotationType.REDACTION -> {
                 annot.rect?.let { r ->
+                    var coverColor = annot.color
+                    if (coverColor == Color.TRANSPARENT || coverColor == 0) {
+                        coverColor = Color.WHITE
+                    }
+                    if (baseBitmap != null && !baseBitmap.isRecycled) {
+                        try {
+                            val leftPx = (r.left * baseBitmap.width).coerceIn(0f, (baseBitmap.width - 1).toFloat())
+                            val topPx = (r.top * baseBitmap.height).coerceIn(0f, (baseBitmap.height - 1).toFloat())
+                            val sampleX = (leftPx - 4f).coerceIn(0f, (baseBitmap.width - 1).toFloat()).toInt()
+                            val sampleY = (topPx - 4f).coerceIn(0f, (baseBitmap.height - 1).toFloat()).toInt()
+                            val sampledPixel = baseBitmap.getPixel(sampleX, sampleY)
+                            val red = Color.red(sampledPixel)
+                            val green = Color.green(sampledPixel)
+                            val blue = Color.blue(sampledPixel)
+                            val lum = (0.299f * red + 0.587f * green + 0.114f * blue) / 255f
+                            if (lum > 0.15f && annot.color == Color.BLACK) {
+                                coverColor = sampledPixel
+                            } else if (annot.color != Color.BLACK) {
+                                coverColor = annot.color
+                            }
+                        } catch (_: Exception) {}
+                    }
                     val redactPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = Color.BLACK
+                        color = coverColor
                         style = Paint.Style.FILL
                     }
-                    val rectF = RectF(r.left * pageW, r.top * pageH, r.right * pageW, r.bottom * pageH)
+                    val rectF = RectF(
+                        (r.left * pageW - 1f).coerceAtLeast(0f),
+                        (r.top * pageH - 1f).coerceAtLeast(0f),
+                        (r.right * pageW + 1f).coerceAtMost(pageW),
+                        (r.bottom * pageH + 1f).coerceAtMost(pageH)
+                    )
                     canvas.drawRect(rectF, redactPaint)
                 }
             }
@@ -1294,36 +1321,81 @@ object PdfEngine {
             return@withContext blocks
         }
 
-        // 2. Generic / Uploaded document text extraction
-        // Read file bytes looking for text segments or fallback to structured lines
+        // 2. Generic / Uploaded document text extraction with Visual Line Detection
         try {
-            val content = pdfFile.readText(Charsets.ISO_8859_1)
-            val extractedLines = mutableListOf<String>()
-            val regex = Regex("""\(([^()]+)\)\s*T[jJ]""")
-            regex.findAll(content).forEach { match ->
-                val line = match.groupValues[1].trim()
-                if (line.length > 2 && !line.startsWith("%")) {
-                    extractedLines.add(line)
-                }
-            }
+            val bmp = renderPageToBitmap(pdfFile, pageIndex, targetWidth = 1080)
+            val visualLines = if (bmp != null) detectVisualLines(bmp) else emptyList()
+            val textStrings = extractPdfPageTextStrings(pdfFile, pageIndex)
 
-            if (extractedLines.isNotEmpty()) {
-                val step = min(0.045f, 0.80f / max(1, extractedLines.size))
-                var yPos = 0.08f
-                extractedLines.take(18).forEach { textLine ->
+            if (visualLines.isNotEmpty()) {
+                // Map extracted text strings to detected visual lines in reading order
+                val words = textStrings.flatMap { it.split("\\s+".toRegex()) }.filter { it.isNotBlank() }
+                var wordIdx = 0
+                val totalWidth = visualLines.sumOf { it.width.toDouble() }.coerceAtLeast(1.0)
+
+                visualLines.forEachIndexed { lineIdx, rect ->
+                    // Proportional words for this line based on line width
+                    val lineWordsCount = max(1, ((rect.width / totalWidth) * words.size).toInt())
+                    val lineWords = if (words.isNotEmpty()) {
+                        val endIdx = min(words.size, wordIdx + lineWordsCount)
+                        val sub = words.subList(wordIdx, endIdx)
+                        wordIdx = endIdx
+                        sub.joinToString(" ")
+                    } else ""
+
+                    val textContent = if (lineWords.isNotBlank()) {
+                        lineWords
+                    } else if (lineIdx < textStrings.size) {
+                        textStrings[lineIdx]
+                    } else {
+                        "Line ${lineIdx + 1}"
+                    }
+
+                    val estimatedFontSize = if (bmp != null) {
+                        max(11f, rect.height * bmp.height * 0.70f)
+                    } else 14f
+
                     blocks.add(
                         PdfTextBlock(
                             pageIndex = pageIndex,
-                            text = textLine,
-                            rect = RectFData(0.08f, yPos, 0.92f, yPos + step * 0.8f),
+                            text = textContent,
+                            originalText = textContent,
+                            rect = rect,
+                            fontSize = estimatedFontSize,
+                            isBold = rect.height > 0.035f || textContent.length < 30
+                        )
+                    )
+                }
+
+                // If remaining words, append to last block
+                if (wordIdx < words.size && blocks.isNotEmpty()) {
+                    val remaining = words.subList(wordIdx, words.size).joinToString(" ")
+                    val last = blocks.last()
+                    blocks[blocks.size - 1] = last.copy(
+                        text = "${last.text} $remaining",
+                        originalText = "${last.originalText} $remaining"
+                    )
+                }
+            } else if (textStrings.isNotEmpty()) {
+                // Fallback: lay out textStrings with calculated non-overlapping step
+                val lineCount = textStrings.size
+                val step = min(0.048f, 0.82f / max(1, lineCount))
+                var yPos = 0.08f
+                textStrings.forEach { line ->
+                    blocks.add(
+                        PdfTextBlock(
+                            pageIndex = pageIndex,
+                            text = line,
+                            originalText = line,
+                            rect = RectFData(0.08f, yPos, 0.92f, (yPos + step * 0.78f).coerceAtMost(0.98f)),
                             fontSize = 13f,
-                            isBold = textLine.length < 25
+                            isBold = line.length < 30
                         )
                     )
                     yPos += step
                 }
             } else {
-                // Generate structured lines spanning page for interactive editing
+                // Fallback structured lines
                 val defaultLines = listOf(
                     "Executive Summary & Document Overview",
                     "Section 1: Operating Terms & Governance Standards",
@@ -1342,12 +1414,13 @@ object PdfEngine {
                         PdfTextBlock(
                             pageIndex = pageIndex,
                             text = line,
-                            rect = RectFData(0.08f, yPos, 0.92f, yPos + 0.038f),
+                            originalText = line,
+                            rect = RectFData(0.08f, yPos, 0.92f, yPos + 0.032f),
                             fontSize = if (line.startsWith("Section") || line.contains("Summary")) 15f else 13f,
                             isBold = line.startsWith("Section") || line.contains("Summary")
                         )
                     )
-                    yPos += 0.065f
+                    yPos += 0.055f
                 }
             }
         } catch (e: Exception) {
@@ -1355,6 +1428,335 @@ object PdfEngine {
         }
 
         return@withContext blocks
+    }
+
+    fun detectVisualLines(bitmap: Bitmap): List<RectFData> {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w < 100 || h < 100) return emptyList()
+
+        // 1. Determine background luminance
+        val sampleCorners = listOf(
+            bitmap.getPixel(5, 5),
+            bitmap.getPixel(w - 6, 5),
+            bitmap.getPixel(5, h - 6),
+            bitmap.getPixel(w - 6, h - 6)
+        )
+        val avgBgLum = sampleCorners.map { p ->
+            (0.299f * Color.red(p) + 0.587f * Color.green(p) + 0.114f * Color.blue(p)) / 255f
+        }.average().toFloat()
+
+        // 2. Count dark pixels per row in page body (5% to 95% width)
+        val xStart = (w * 0.05f).toInt()
+        val xEnd = (w * 0.95f).toInt()
+        val stepX = 2
+        val yStart = (h * 0.03f).toInt()
+        val yEnd = (h * 0.97f).toInt()
+
+        val rowDensities = IntArray(h)
+        for (y in yStart until yEnd) {
+            var darkCount = 0
+            for (x in xStart until xEnd step stepX) {
+                val p = bitmap.getPixel(x, y)
+                val lum = (0.299f * Color.red(p) + 0.587f * Color.green(p) + 0.114f * Color.blue(p)) / 255f
+                if (kotlin.math.abs(lum - avgBgLum) > 0.22f) {
+                    darkCount++
+                }
+            }
+            rowDensities[y] = darkCount
+        }
+
+        // 3. Find vertical bands
+        val threshold = max(5, ((xEnd - xStart) / stepX * 0.015f).toInt())
+        val bands = mutableListOf<Pair<Int, Int>>()
+        var inBand = false
+        var bandStart = 0
+        var consecutiveZero = 0
+
+        for (y in yStart until yEnd) {
+            val d = rowDensities[y]
+            if (d >= threshold) {
+                if (!inBand) {
+                    inBand = true
+                    bandStart = y
+                }
+                consecutiveZero = 0
+            } else {
+                if (inBand) {
+                    consecutiveZero++
+                    if (consecutiveZero >= 3) {
+                        val bandEnd = y - consecutiveZero
+                        if (bandEnd - bandStart >= 6) {
+                            bands.add(bandStart to bandEnd)
+                        }
+                        inBand = false
+                        consecutiveZero = 0
+                    }
+                }
+            }
+        }
+        if (inBand && (yEnd - bandStart >= 6)) {
+            bands.add(bandStart to (yEnd - consecutiveZero))
+        }
+
+        // 4. Split bands taller than 1.8x median
+        val splitBands = mutableListOf<Pair<Int, Int>>()
+        val medianHeight = if (bands.isNotEmpty()) {
+            val heights = bands.map { it.second - it.first }.sorted()
+            heights[heights.size / 2]
+        } else 20
+
+        for (b in bands) {
+            val bHeight = b.second - b.first
+            if (bHeight > medianHeight * 1.8f && bHeight > 35) {
+                var minDensity = Int.MAX_VALUE
+                var splitY = -1
+                val searchStart = b.first + (bHeight * 0.3f).toInt()
+                val searchEnd = b.second - (bHeight * 0.3f).toInt()
+                for (y in searchStart..searchEnd) {
+                    if (rowDensities[y] < minDensity) {
+                        minDensity = rowDensities[y]
+                        splitY = y
+                    }
+                }
+                if (splitY != -1 && minDensity < threshold * 2) {
+                    splitBands.add(b.first to splitY)
+                    splitBands.add(splitY + 1 to b.second)
+                } else {
+                    splitBands.add(b)
+                }
+            } else {
+                splitBands.add(b)
+            }
+        }
+
+        // 5. Compute horizontal bounding boxes
+        val rawRects = mutableListOf<RectFData>()
+        for (b in splitBands) {
+            var minX = w
+            var maxX = 0
+            for (y in b.first..b.second) {
+                for (x in xStart until xEnd step stepX) {
+                    val p = bitmap.getPixel(x, y)
+                    val lum = (0.299f * Color.red(p) + 0.587f * Color.green(p) + 0.114f * Color.blue(p)) / 255f
+                    if (kotlin.math.abs(lum - avgBgLum) > 0.22f) {
+                        if (x < minX) minX = x
+                        if (x > maxX) maxX = x
+                    }
+                }
+            }
+            if (maxX > minX + 10) {
+                val padX = 6f
+                val leftNorm = ((minX - padX).coerceAtLeast(0f) / w.toFloat()).coerceIn(0f, 1f)
+                val rightNorm = ((maxX + padX).coerceAtMost(w.toFloat()) / w.toFloat()).coerceIn(0f, 1f)
+                val topNorm = (b.first / h.toFloat()).coerceIn(0f, 1f)
+                val bottomNorm = (b.second / h.toFloat()).coerceIn(0f, 1f)
+                rawRects.add(RectFData(leftNorm, topNorm, rightNorm, bottomNorm))
+            }
+        }
+
+        // 6. Enforce minimum vertical gap between adjacent lines to prevent overlapping touch targets
+        val result = mutableListOf<RectFData>()
+        val minGap = 0.005f
+        for (i in rawRects.indices) {
+            var curr = rawRects[i]
+            if (i > 0) {
+                val prev = result[i - 1]
+                if (curr.top < prev.bottom + minGap) {
+                    val mid = (prev.bottom + curr.top) / 2f
+                    result[i - 1] = prev.copy(bottom = (mid - minGap / 2f).coerceAtLeast(prev.top + 0.004f))
+                    curr = curr.copy(top = (mid + minGap / 2f).coerceAtMost(curr.bottom - 0.004f))
+                }
+            }
+            result.add(curr)
+        }
+
+        return result
+    }
+
+    fun extractPdfPageTextStrings(pdfFile: File, pageIndex: Int): List<String> {
+        val lines = mutableListOf<String>()
+        try {
+            val bytes = pdfFile.readBytes()
+            val textContent = String(bytes, Charsets.ISO_8859_1)
+
+            // Extract all PDF streams
+            val streams = extractStreamsFromPdf(bytes)
+            for (st in streams) {
+                val stText = String(st, Charsets.ISO_8859_1)
+                lines.addAll(parsePdfStreamText(stText))
+            }
+
+            if (lines.isEmpty()) {
+                // Fallback to text inside raw content
+                lines.addAll(parsePdfStreamText(textContent))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error extracting PDF page text strings", e)
+        }
+        return lines.filter { it.length > 1 && !it.startsWith("%") }
+    }
+
+    private fun extractStreamsFromPdf(bytes: ByteArray): List<ByteArray> {
+        val streams = mutableListOf<ByteArray>()
+        var idx = 0
+        val streamMarker = "stream".toByteArray(Charsets.US_ASCII)
+        val endstreamMarker = "endstream".toByteArray(Charsets.US_ASCII)
+
+        while (idx < bytes.size - streamMarker.size) {
+            val sIdx = bytes.indexOfSequence(streamMarker, idx)
+            if (sIdx == -1) break
+
+            var start = sIdx + streamMarker.size
+            if (start < bytes.size && bytes[start] == '\r'.code.toByte()) start++
+            if (start < bytes.size && bytes[start] == '\n'.code.toByte()) start++
+
+            val eIdx = bytes.indexOfSequence(endstreamMarker, start)
+            if (eIdx == -1) break
+
+            var end = eIdx
+            if (end > start && bytes[end - 1] == '\n'.code.toByte()) end--
+            if (end > start && bytes[end - 1] == '\r'.code.toByte()) end--
+
+            val length = end - start
+            if (length > 0) {
+                val streamData = bytes.copyOfRange(start, end)
+                val decompressed = tryDecompressFlate(streamData) ?: streamData
+                streams.add(decompressed)
+            }
+            idx = eIdx + endstreamMarker.size
+        }
+        return streams
+    }
+
+    private fun tryDecompressFlate(data: ByteArray): ByteArray? {
+        return try {
+            val inflater = java.util.zip.Inflater(false)
+            inflater.setInput(data)
+            val bos = java.io.ByteArrayOutputStream(data.size * 2)
+            val buffer = ByteArray(4096)
+            while (!inflater.finished()) {
+                val count = inflater.inflate(buffer)
+                if (count == 0 && inflater.needsInput()) break
+                bos.write(buffer, 0, count)
+            }
+            inflater.end()
+            bos.toByteArray()
+        } catch (_: Exception) {
+            try {
+                val inflater = java.util.zip.Inflater(true)
+                inflater.setInput(data)
+                val bos = java.io.ByteArrayOutputStream(data.size * 2)
+                val buffer = ByteArray(4096)
+                while (!inflater.finished()) {
+                    val count = inflater.inflate(buffer)
+                    if (count == 0 && inflater.needsInput()) break
+                    bos.write(buffer, 0, count)
+                }
+                inflater.end()
+                bos.toByteArray()
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    private fun ByteArray.indexOfSequence(seq: ByteArray, start: Int): Int {
+        for (i in start..this.size - seq.size) {
+            var match = true
+            for (j in seq.indices) {
+                if (this[i + j] != seq[j]) {
+                    match = false
+                    break
+                }
+            }
+            if (match) return i
+        }
+        return -1
+    }
+
+    private fun parsePdfStreamText(content: String): List<String> {
+        val lines = mutableListOf<String>()
+
+        // 1. Parse TJ arrays: [(chunk1) 10 (chunk2)] TJ
+        val tjArrayRegex = Regex("""\[(.*?)\]\s*TJ""", RegexOption.DOT_MATCHES_ALL)
+        tjArrayRegex.findAll(content).forEach { match ->
+            val inner = match.groupValues[1]
+            val chunkRegex = Regex("""\((.*?)\)""")
+            val sb = java.lang.StringBuilder()
+            chunkRegex.findAll(inner).forEach { chunkMatch ->
+                sb.append(decodePdfString(chunkMatch.groupValues[1]))
+            }
+            val text = sb.toString().trim()
+            if (text.length > 2) lines.add(text)
+        }
+
+        // 2. Parse Tj and single-quote operators: (text) Tj
+        val tjRegex = Regex("""\((.*?)\)\s*(?:Tj|'|")""")
+        tjRegex.findAll(content).forEach { match ->
+            val text = decodePdfString(match.groupValues[1]).trim()
+            if (text.length > 2) lines.add(text)
+        }
+
+        // 3. Hex strings: <48656c6c6f> Tj
+        val hexRegex = Regex("""<([0-9a-fA-F]+)>\s*(?:Tj|'|")""")
+        hexRegex.findAll(content).forEach { match ->
+            val hex = match.groupValues[1]
+            val sb = java.lang.StringBuilder()
+            for (i in 0 until hex.length - 1 step 2) {
+                val b = hex.substring(i, i + 2).toIntOrNull(16) ?: 0
+                if (b in 32..126) sb.append(b.toChar())
+            }
+            val text = sb.toString().trim()
+            if (text.length > 2) lines.add(text)
+        }
+
+        return lines
+    }
+
+    private fun decodePdfString(raw: String): String {
+        return raw.replace("\\\\", "\\")
+            .replace("\\(", "(")
+            .replace("\\)", ")")
+            .replace("\\n", " ")
+            .replace("\\r", " ")
+            .replace("\\t", " ")
+    }
+
+    suspend fun searchAllPages(
+        sourcePdf: File,
+        pages: List<FolioPageState>,
+        query: String
+    ): List<PdfTextMatch> = withContext(Dispatchers.IO) {
+        if (query.isBlank() || pages.isEmpty()) return@withContext emptyList()
+        val matches = mutableListOf<PdfTextMatch>()
+        val lowerQuery = query.lowercase().trim()
+
+        pages.forEachIndexed { pageIdx, pageState ->
+            val blocks = if (pageState.textBlocks.isNotEmpty()) {
+                pageState.textBlocks
+            } else {
+                extractTextBlocks(sourcePdf, pageState.originalPageIndex)
+            }
+
+            blocks.forEachIndexed { lineIdx, block ->
+                // Check if block text contains the query
+                if (block.text.lowercase().contains(lowerQuery)) {
+                    matches.add(
+                        PdfTextMatch(
+                            pageIndex = pageIdx,
+                            originalPageIndex = pageState.originalPageIndex,
+                            lineIndex = lineIdx,
+                            lineText = block.text,
+                            blockRect = block.rect,
+                            matchedWord = query,
+                            textBlockId = block.id
+                        )
+                    )
+                }
+            }
+        }
+        return@withContext matches
     }
 
     suspend fun findAndReplaceText(

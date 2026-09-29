@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -41,6 +42,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -284,12 +286,24 @@ fun EditDocumentTextDialog(
 @Composable
 fun FindAndReplaceDialog(
     initialFindText: String = "",
-    onDismiss: () -> Unit,
-    onExecute: (findText: String, replaceText: String, isEntireDoc: Boolean) -> Unit
+    searchMatches: List<com.example.engine.PdfTextMatch> = emptyList(),
+    isSearching: Boolean = false,
+    onSearch: (String) -> Unit = {},
+    onReplaceSingle: (com.example.engine.PdfTextMatch, String) -> Unit = { _, _ -> },
+    onReplacePage: (pageIndex: Int, query: String, replacement: String) -> Unit = { _, _, _ -> },
+    onReplaceAll: (query: String, replacement: String) -> Unit = { _, _ -> },
+    onDismiss: () -> Unit
 ) {
     var findText by remember { mutableStateOf(initialFindText) }
     var replaceText by remember { mutableStateOf("") }
-    var isEntireDocument by remember { mutableStateOf(true) }
+    var lastReplacedMessage by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(findText) {
+        if (findText.isNotBlank()) {
+            kotlinx.coroutines.delay(200)
+            onSearch(findText)
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -311,24 +325,38 @@ fun FindAndReplaceDialog(
             }
         },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 480.dp)
+            ) {
                 Text(
-                    text = "Search for any phrase or value in the PDF and replace it automatically:",
+                    text = "Search across all pages in the PDF and replace occurrences:",
                     fontSize = 12.sp,
                     color = InkSecondary
                 )
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
                 OutlinedTextField(
                     value = findText,
-                    onValueChange = { findText = it },
+                    onValueChange = {
+                        findText = it
+                        lastReplacedMessage = null
+                    },
                     label = { Text("Find text...") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(10.dp)
+                    shape = RoundedCornerShape(10.dp),
+                    trailingIcon = {
+                        if (findText.isNotEmpty()) {
+                            IconButton(onClick = { findText = "" }) {
+                                Icon(Icons.Default.Close, contentDescription = "Clear", modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
                 )
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 OutlinedTextField(
                     value = replaceText,
@@ -339,42 +367,205 @@ fun FindAndReplaceDialog(
                     shape = RoundedCornerShape(10.dp)
                 )
 
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
-                Text(text = "Search Scope:", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = InkSecondary)
-                Spacer(modifier = Modifier.height(4.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = isEntireDocument,
-                        onClick = { isEntireDocument = true },
-                        label = { Text("All Pages in PDF", fontSize = 12.sp) }
-                    )
-                    FilterChip(
-                        selected = !isEntireDocument,
-                        onClick = { isEntireDocument = false },
-                        label = { Text("Current Page Only", fontSize = 12.sp) }
-                    )
+                // Search Results / Status Banner
+                if (isSearching) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp)
+                    ) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            color = CranberryPrimary,
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Scanning document pages...",
+                            fontSize = 12.sp,
+                            color = InkSecondary
+                        )
+                    }
+                } else if (lastReplacedMessage != null) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color(0xFFECFDF5),
+                        shape = RoundedCornerShape(8.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF10B981))
+                    ) {
+                        Text(
+                            text = lastReplacedMessage ?: "",
+                            fontSize = 12.sp,
+                            color = Color(0xFF047857),
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                } else if (findText.isNotBlank()) {
+                    if (searchMatches.isEmpty()) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = CranberryPale,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = "No matches found for '$findText'",
+                                fontSize = 12.sp,
+                                color = CranberryPrimary,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    } else {
+                        val pagesList = searchMatches.map { it.pageIndex + 1 }
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = Color(0xFFEFF6FF),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text(
+                                    text = "${searchMatches.size} match(es) found on page(s): ${pagesList.joinToString(", ")}",
+                                    fontSize = 12.sp,
+                                    color = Color(0xFF1D4ED8),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // Per-page replace chips
+                        val distinctPages = searchMatches.map { it.pageIndex }.distinct()
+                        if (distinctPages.size > 1) {
+                            Text(
+                                text = "Replace on specific page:",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = InkSecondary
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            androidx.compose.foundation.lazy.LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                items(distinctPages) { pIdx ->
+                                    val countOnPage = searchMatches.count { it.pageIndex == pIdx }
+                                    FilterChip(
+                                        selected = false,
+                                        onClick = {
+                                            if (replaceText.isNotBlank()) {
+                                                onReplacePage(pIdx, findText, replaceText)
+                                                lastReplacedMessage = "Replaced $countOnPage match(es) on Page ${pIdx + 1}"
+                                            }
+                                        },
+                                        enabled = replaceText.isNotBlank(),
+                                        label = { Text("Page ${pIdx + 1} ($countOnPage)", fontSize = 11.sp) }
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+
+                        // Matches list for single-occurrence replacement
+                        Text(
+                            text = "Occurrences (${searchMatches.size}):",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = InkSecondary
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        LazyColumn(
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 160.dp)
+                        ) {
+                            items(searchMatches) { match ->
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = Color(0xFFF9FAFB)),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE5E7EB)),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                            Surface(
+                                                color = CranberryPrimary.copy(alpha = 0.1f),
+                                                shape = RoundedCornerShape(4.dp)
+                                            ) {
+                                                Text(
+                                                    text = "Page ${match.pageIndex + 1}",
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = CranberryPrimary,
+                                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = match.lineText,
+                                                fontSize = 11.sp,
+                                                maxLines = 2,
+                                                color = InkPrimary
+                                            )
+                                        }
+
+                                        Button(
+                                            onClick = {
+                                                if (replaceText.isNotBlank()) {
+                                                    onReplaceSingle(match, replaceText)
+                                                    lastReplacedMessage = "Replaced occurrence on Page ${match.pageIndex + 1}"
+                                                }
+                                            },
+                                            enabled = replaceText.isNotBlank(),
+                                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                            shape = RoundedCornerShape(6.dp),
+                                            colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary)
+                                        ) {
+                                            Text("Replace", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
-                    if (findText.isNotBlank()) {
-                        onExecute(findText, replaceText, isEntireDocument)
+                    if (findText.isNotBlank() && searchMatches.isNotEmpty()) {
+                        val count = searchMatches.size
+                        val pages = searchMatches.map { it.pageIndex + 1 }.distinct().joinToString(", ")
+                        onReplaceAll(findText, replaceText)
+                        lastReplacedMessage = "Replaced $count match(es) across pages: $pages"
                         onDismiss()
                     }
                 },
-                enabled = findText.isNotBlank(),
+                enabled = findText.isNotBlank() && searchMatches.isNotEmpty() && replaceText.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary),
                 shape = RoundedCornerShape(10.dp),
                 modifier = Modifier.testTag("execute_find_replace_btn")
             ) {
-                Text("Replace All Matches", fontWeight = FontWeight.Bold)
+                Text(
+                    text = if (searchMatches.isNotEmpty()) "Replace All in PDF (${searchMatches.size})" else "Replace All Matches",
+                    fontWeight = FontWeight.Bold
+                )
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) { Text("Close") }
         }
     )
 }

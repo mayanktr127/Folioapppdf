@@ -121,6 +121,8 @@ fun EditorScreen(
     val annotations by viewModel.annotations.collectAsState()
     val isProcessing by viewModel.isProcessing.collectAsState()
     val savedSignatures by viewModel.savedSignatures.collectAsState()
+    val searchMatches by viewModel.searchMatches.collectAsState()
+    val isSearching by viewModel.isSearching.collectAsState()
 
     // Dialog states
     var showSignatureDialog by remember { mutableStateOf(false) }
@@ -929,10 +931,13 @@ fun EditorScreen(
     // Find and Replace Dialog
     if (showFindReplaceDialog) {
         FindAndReplaceDialog(
-            onDismiss = { showFindReplaceDialog = false },
-            onExecute = { find, replace, isEntireDoc ->
-                viewModel.executeFindAndReplace(find, replace, isEntireDoc)
-            }
+            searchMatches = searchMatches,
+            isSearching = isSearching,
+            onSearch = { query -> viewModel.searchInDocument(query) },
+            onReplaceSingle = { match, repl -> viewModel.replaceSingleOccurrence(match, repl) },
+            onReplacePage = { pageIdx, query, repl -> viewModel.replaceOnPage(pageIdx, query, repl) },
+            onReplaceAll = { query, repl -> viewModel.executeFindAndReplace(query, repl, isEntireDoc = true) },
+            onDismiss = { showFindReplaceDialog = false }
         )
     }
 
