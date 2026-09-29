@@ -20,14 +20,18 @@ import com.example.engine.AnnotationData
 import com.example.engine.AnnotationType
 import com.example.engine.CompressionPreset
 import com.example.engine.CompressionResult
+import com.example.engine.FolioDocumentState
+import com.example.engine.FolioPageState
 import com.example.engine.PdfEngine
 import com.example.engine.PdfTextBlock
+import com.example.engine.PdfValidationResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -144,6 +148,18 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         initialValue = emptyList()
     )
 
+    // UNIFIED DOCUMENT STATE - Single Source of Truth
+    private val _docState = MutableStateFlow<FolioDocumentState?>(null)
+    val docState = _docState.asStateFlow()
+
+    val hasUnsavedChanges: StateFlow<Boolean> = _docState.map {
+        it?.hasUnsavedChanges == true
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = false
+    )
+
     // Active Editor State
     private val _activeDocument = MutableStateFlow<PdfDocumentItem?>(null)
     val activeDocument = _activeDocument.asStateFlow()
@@ -169,8 +185,9 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     private val _annotations = MutableStateFlow<List<AnnotationData>>(emptyList())
     val annotations = _annotations.asStateFlow()
 
-    private val undoStack = mutableListOf<List<AnnotationData>>()
-    private val redoStack = mutableListOf<List<AnnotationData>>()
+    // Undo / Redo stack holding complete document states
+    private val undoStateStack = mutableListOf<FolioDocumentState>()
+    private val redoStateStack = mutableListOf<FolioDocumentState>()
 
     // Compression State
     private val _compressionResult = MutableStateFlow<CompressionResult?>(null)
@@ -254,12 +271,49 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openDocument(doc: PdfDocumentItem) {
+        val file = File(doc.filePath)
+        if (!file.exists()) {
+            _statusMessage.value = "File not found: ${doc.title}"
+            return
+        }
+
+        // Validate PDF reliably
+        val validation = PdfEngine.validatePdfFile(file)
+        when (validation) {
+            PdfValidationResult.PasswordProtected -> {
+                _statusMessage.value = "Document is password protected. Enter password to unlock."
+                return
+            }
+            PdfValidationResult.CorruptedOrNotPdf -> {
+                _statusMessage.value = "Cannot open: File is corrupted or not a valid PDF."
+                return
+            }
+            PdfValidationResult.EmptyOrZeroPages -> {
+                _statusMessage.value = "Cannot open: PDF contains 0 pages."
+                return
+            }
+            PdfValidationResult.Valid -> { /* Valid file */ }
+        }
+
+        val pageCount = doc.pageCount
+        val initialPages = (0 until maxOf(1, pageCount)).map {
+            FolioPageState(originalPageIndex = it)
+        }
+
+        val initialState = FolioDocumentState(
+            docItem = doc,
+            sourceFile = file,
+            pages = initialPages,
+            hasUnsavedChanges = false
+        )
+
         _activeDocument.value = doc
+        _docState.value = initialState
         _activePageIndex.value = 0
-        _annotations.value = emptyList()
-        undoStack.clear()
-        redoStack.clear()
+        undoStateStack.clear()
+        redoStateStack.clear()
         _editorTool.value = EditorTool.NONE
+
         viewModelScope.launch {
             repository.markAccessed(doc.id)
             loadActivePage()
@@ -268,19 +322,35 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun loadActivePage() {
-        val doc = _activeDocument.value ?: return
-        val file = File(doc.filePath)
-        if (file.exists()) {
-            val bmp = PdfEngine.renderPageToBitmap(file, _activePageIndex.value, targetWidth = 1080)
-            _activePageBitmap.value = bmp
-            val blocks = PdfEngine.extractTextBlocks(file, _activePageIndex.value)
-            _currentTextBlocks.value = blocks
+        val state = _docState.value ?: return
+        if (state.pages.isEmpty()) return
+
+        val safeIndex = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
+        if (_activePageIndex.value != safeIndex) {
+            _activePageIndex.value = safeIndex
         }
+
+        val pageState = state.pages[safeIndex]
+        val bmp = PdfEngine.renderPageStateToBitmap(state.sourceFile, pageState, targetWidth = 1080)
+        _activePageBitmap.value = bmp
+
+        val blocks = if (pageState.textBlocks.isNotEmpty()) {
+            pageState.textBlocks
+        } else {
+            val extracted = PdfEngine.extractTextBlocks(state.sourceFile, pageState.originalPageIndex)
+            val updatedPages = state.pages.toMutableList()
+            updatedPages[safeIndex] = pageState.copy(textBlocks = extracted)
+            _docState.value = state.copy(pages = updatedPages)
+            extracted
+        }
+
+        _currentTextBlocks.value = blocks
+        _annotations.value = pageState.annotations
     }
 
     fun setPageIndex(newIndex: Int) {
-        val doc = _activeDocument.value ?: return
-        if (newIndex in 0 until doc.pageCount) {
+        val state = _docState.value ?: return
+        if (newIndex in 0 until state.pages.size) {
             _activePageIndex.value = newIndex
             viewModelScope.launch {
                 loadActivePage()
@@ -301,140 +371,243 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun addAnnotation(annotation: AnnotationData) {
-        undoStack.add(_annotations.value.toList())
-        redoStack.clear()
-        _annotations.value = _annotations.value + annotation
+        val state = _docState.value ?: return
+        val safeIndex = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
+        val pageState = state.pages[safeIndex]
+
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        val updatedAnnots = pageState.annotations + annotation.copy(pageIndex = safeIndex)
+        val updatedPages = state.pages.toMutableList()
+        updatedPages[safeIndex] = pageState.copy(annotations = updatedAnnots)
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        _annotations.value = updatedAnnots
     }
 
     fun editTextInPdf(block: PdfTextBlock, newText: String, color: Int, isBold: Boolean) {
-        undoStack.add(_annotations.value.toList())
-        redoStack.clear()
+        val state = _docState.value ?: return
+        val safeIndex = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
+        val pageState = state.pages[safeIndex]
+
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
         val annot = AnnotationData(
-            pageIndex = block.pageIndex,
+            pageIndex = safeIndex,
             type = AnnotationType.TEXT_REPLACE,
             rect = block.rect,
             text = newText,
-            originalText = block.text,
+            originalText = block.originalText,
             color = color,
             strokeWidth = if (isBold) 2f else 1f
         )
-        // Remove existing annotation targeting same rect
-        _annotations.value = _annotations.value.filterNot {
-            it.pageIndex == block.pageIndex && it.rect == block.rect
+
+        val updatedAnnots = pageState.annotations.filterNot {
+            it.rect == block.rect && (it.type == AnnotationType.TEXT_REPLACE || it.type == AnnotationType.OVERLAY_EDIT)
         } + annot
 
-        // Update active page text blocks state
-        _currentTextBlocks.value = _currentTextBlocks.value.map {
-            if (it.id == block.id || (it.pageIndex == block.pageIndex && it.rect == block.rect)) {
+        val updatedBlocks = pageState.textBlocks.map {
+            if (it.id == block.id || it.rect == block.rect) {
                 it.copy(text = newText, isModified = true, textColor = color, isBold = isBold)
             } else it
         }
+
+        val updatedPages = state.pages.toMutableList()
+        updatedPages[safeIndex] = pageState.copy(
+            annotations = updatedAnnots,
+            textBlocks = updatedBlocks
+        )
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        _annotations.value = updatedAnnots
+        _currentTextBlocks.value = updatedBlocks
         _statusMessage.value = "Updated text in PDF"
     }
 
     fun deleteTextInPdf(block: PdfTextBlock) {
-        undoStack.add(_annotations.value.toList())
-        redoStack.clear()
+        val state = _docState.value ?: return
+        val safeIndex = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
+        val pageState = state.pages[safeIndex]
+
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
         val annot = AnnotationData(
-            pageIndex = block.pageIndex,
+            pageIndex = safeIndex,
             type = AnnotationType.TEXT_REPLACE,
             rect = block.rect,
             text = "",
-            originalText = block.text,
+            originalText = block.originalText,
             color = android.graphics.Color.WHITE
         )
-        _annotations.value = _annotations.value.filterNot {
-            it.pageIndex == block.pageIndex && it.rect == block.rect
+
+        val updatedAnnots = pageState.annotations.filterNot {
+            it.rect == block.rect && it.type == AnnotationType.TEXT_REPLACE
         } + annot
 
-        _currentTextBlocks.value = _currentTextBlocks.value.map {
-            if (it.id == block.id || (it.pageIndex == block.pageIndex && it.rect == block.rect)) {
+        val updatedBlocks = pageState.textBlocks.map {
+            if (it.id == block.id || it.rect == block.rect) {
                 it.copy(text = "", isModified = true)
             } else it
         }
+
+        val updatedPages = state.pages.toMutableList()
+        updatedPages[safeIndex] = pageState.copy(
+            annotations = updatedAnnots,
+            textBlocks = updatedBlocks
+        )
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        _annotations.value = updatedAnnots
+        _currentTextBlocks.value = updatedBlocks
         _statusMessage.value = "Cleared text line"
     }
 
     fun executeFindAndReplace(findText: String, replaceText: String, isEntireDoc: Boolean) {
-        val doc = _activeDocument.value ?: return
-        val file = File(doc.filePath)
-        if (!file.exists() || findText.isBlank()) return
+        val state = _docState.value ?: return
+        if (findText.isBlank()) return
 
         viewModelScope.launch {
             _isProcessing.value = true
+            undoStateStack.add(state)
+            redoStateStack.clear()
+
             var totalMatches = 0
-            undoStack.add(_annotations.value.toList())
-            redoStack.clear()
+            val targetIndices = if (isEntireDoc) (0 until state.pages.size) else listOf(_activePageIndex.value)
+            val updatedPages = state.pages.toMutableList()
 
-            val pagesToProcess = if (isEntireDoc) (0 until doc.pageCount) else listOf(_activePageIndex.value)
-            val newAnnots = _annotations.value.toMutableList()
+            for (idx in targetIndices) {
+                val pageState = updatedPages[idx]
+                val blocks = if (pageState.textBlocks.isNotEmpty()) {
+                    pageState.textBlocks
+                } else {
+                    PdfEngine.extractTextBlocks(state.sourceFile, pageState.originalPageIndex)
+                }
 
-            for (p in pagesToProcess) {
-                val blocks = PdfEngine.extractTextBlocks(file, p)
-                for (block in blocks) {
-                    if (block.text.contains(findText, ignoreCase = true)) {
+                var pageModified = false
+                val newAnnots = pageState.annotations.toMutableList()
+                val newBlocks = blocks.map { b ->
+                    if (b.text.contains(findText, ignoreCase = true)) {
                         totalMatches++
-                        val modified = block.text.replace(findText, replaceText, ignoreCase = true)
-                        newAnnots.removeAll { it.pageIndex == p && it.rect == block.rect }
+                        pageModified = true
+                        val replaced = b.text.replace(findText, replaceText, ignoreCase = true)
+                        newAnnots.removeAll { it.rect == b.rect && it.type == AnnotationType.TEXT_REPLACE }
                         newAnnots.add(
                             AnnotationData(
-                                pageIndex = p,
+                                pageIndex = idx,
                                 type = AnnotationType.TEXT_REPLACE,
-                                rect = block.rect,
-                                text = modified,
-                                originalText = block.text,
-                                color = block.textColor,
-                                strokeWidth = if (block.isBold) 2f else 1f
+                                rect = b.rect,
+                                text = replaced,
+                                originalText = b.originalText,
+                                color = b.textColor,
+                                strokeWidth = if (b.isBold) 2f else 1f
                             )
                         )
-                    }
+                        b.copy(text = replaced, isModified = true)
+                    } else b
+                }
+
+                if (pageModified) {
+                    updatedPages[idx] = pageState.copy(
+                        annotations = newAnnots,
+                        textBlocks = newBlocks
+                    )
                 }
             }
 
-            _annotations.value = newAnnots
-            _currentTextBlocks.value = _currentTextBlocks.value.map { block ->
-                if (block.text.contains(findText, ignoreCase = true)) {
-                    block.copy(
-                        text = block.text.replace(findText, replaceText, ignoreCase = true),
-                        isModified = true
-                    )
-                } else block
-            }
-
+            _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+            loadActivePage()
             _isProcessing.value = false
-            _statusMessage.value = "Replaced $totalMatches match(es) in document"
+            _statusMessage.value = "Replaced $totalMatches match(es) across document"
         }
     }
 
+    fun updateDocumentPages(newPages: List<FolioPageState>) {
+        val state = _docState.value ?: return
+        if (newPages.isEmpty()) {
+            _statusMessage.value = "Cannot delete all pages. At least 1 page is required."
+            return
+        }
+
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        _docState.value = state.copy(pages = newPages, hasUnsavedChanges = true)
+        _activePageIndex.value = _activePageIndex.value.coerceIn(0, newPages.size - 1)
+        viewModelScope.launch {
+            loadActivePage()
+        }
+        _statusMessage.value = "Updated document pages (${newPages.size} pages)"
+    }
+
+    fun rotateActivePage(degrees: Float = 90f) {
+        val state = _docState.value ?: return
+        val idx = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
+        val page = state.pages[idx]
+
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        val updatedPages = state.pages.toMutableList()
+        val newRot = (page.rotationDegrees + degrees) % 360f
+        updatedPages[idx] = page.copy(rotationDegrees = newRot)
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        viewModelScope.launch {
+            loadActivePage()
+        }
+        _statusMessage.value = "Rotated page by ${degrees.toInt()}°"
+    }
+
     fun undo() {
-        if (undoStack.isNotEmpty()) {
-            redoStack.add(_annotations.value.toList())
-            _annotations.value = undoStack.removeAt(undoStack.size - 1)
+        val current = _docState.value ?: return
+        if (undoStateStack.isNotEmpty()) {
+            redoStateStack.add(current)
+            val prev = undoStateStack.removeAt(undoStateStack.size - 1)
+            _docState.value = prev
+            viewModelScope.launch {
+                loadActivePage()
+            }
         }
     }
 
     fun redo() {
-        if (redoStack.isNotEmpty()) {
-            undoStack.add(_annotations.value.toList())
-            _annotations.value = redoStack.removeAt(redoStack.size - 1)
+        val current = _docState.value ?: return
+        if (redoStateStack.isNotEmpty()) {
+            undoStateStack.add(current)
+            val next = redoStateStack.removeAt(redoStateStack.size - 1)
+            _docState.value = next
+            viewModelScope.launch {
+                loadActivePage()
+            }
         }
     }
 
     fun clearPageAnnotations() {
-        undoStack.add(_annotations.value.toList())
-        val currentPage = _activePageIndex.value
-        _annotations.value = _annotations.value.filter { it.pageIndex != currentPage }
+        val state = _docState.value ?: return
+        val safeIndex = _activePageIndex.value.coerceIn(0, state.pages.size - 1)
+        val page = state.pages[safeIndex]
+
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        val updatedPages = state.pages.toMutableList()
+        updatedPages[safeIndex] = page.copy(annotations = emptyList())
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        _annotations.value = emptyList()
     }
 
     fun saveAnnotatedCopy(customFileName: String? = null) {
-        val doc = _activeDocument.value ?: return
-        val sourceFile = File(doc.filePath)
-        if (!sourceFile.exists()) return
+        val state = _docState.value ?: return
+        if (state.pages.isEmpty() || !state.sourceFile.exists()) return
 
         viewModelScope.launch {
             _isProcessing.value = true
             val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
-            val baseName = doc.title.removeSuffix(".pdf")
+            val baseName = state.docItem.title.removeSuffix(".pdf")
             val newTitle = if (!customFileName.isNullOrBlank()) {
                 if (customFileName.endsWith(".pdf", ignoreCase = true)) customFileName else "$customFileName.pdf"
             } else {
@@ -442,10 +615,12 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             }
             val destFile = File(docsDir, "${System.currentTimeMillis()}_$newTitle")
 
-            val success = PdfEngine.saveAnnotatedPdf(sourceFile, _annotations.value, destFile)
+            // Serialize combined document state (pages in order, rotations, text edits, annotations)
+            val success = PdfEngine.saveDocumentState(state, destFile)
             if (success) {
-                val parses = PdfEngine.verifyPdfParses(destFile, expectedPageCount = doc.pageCount)
-                if (parses) {
+                // Re-open in-memory and verify with PdfRenderer
+                val verified = PdfEngine.verifyExportedDocument(destFile, state)
+                if (verified) {
                     val pageCount = PdfEngine.getPageCount(destFile)
                     val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
                     val newItem = PdfDocumentItem(
@@ -454,15 +629,14 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                         fileSize = destFile.length(),
                         pageCount = pageCount,
                         thumbnailPath = thumb,
-                        category = doc.category
+                        category = state.docItem.category
                     )
                     val newId = repository.addDocument(newItem)
                     val savedItem = newItem.copy(id = newId)
+
+                    // Update active state to saved item and clear unsaved changes flag
+                    _docState.value = state.copy(docItem = savedItem, sourceFile = destFile, hasUnsavedChanges = false)
                     _activeDocument.value = savedItem
-                    _annotations.value = emptyList()
-                    undoStack.clear()
-                    redoStack.clear()
-                    loadActivePage()
 
                     com.example.util.NotificationHelper.showPdfReadyNotification(
                         getApplication(),
@@ -470,10 +644,10 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                         pageCount
                     )
 
-                    _savedResultDoc.value = savedItem to doc
-                    _statusMessage.value = "PDF ready: $newTitle"
+                    _savedResultDoc.value = savedItem to state.docItem
+                    _statusMessage.value = "PDF saved & verified: $newTitle"
                 } else {
-                    _statusMessage.value = "Verification error: Saved output failed parse validation."
+                    _statusMessage.value = "Verification error: Exported PDF failed post-save validation."
                 }
             } else {
                 _statusMessage.value = "Failed to serialize and save PDF"
@@ -582,27 +756,55 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun splitPdfRange(doc: PdfDocumentItem, startPage: Int, endPage: Int, outputName: String) {
-        val file = File(doc.filePath)
-        if (!file.exists()) return
         viewModelScope.launch {
             _isProcessing.value = true
+            // If the document being split is the active document, operate on its current edited state!
+            val currentState = if (_docState.value?.docItem?.id == doc.id) {
+                _docState.value!!
+            } else {
+                val file = File(doc.filePath)
+                val pCount = PdfEngine.getPageCount(file)
+                FolioDocumentState(
+                    docItem = doc,
+                    sourceFile = file,
+                    pages = (0 until maxOf(1, pCount)).map { FolioPageState(originalPageIndex = it) }
+                )
+            }
+
+            val total = currentState.pages.size
+            if (total == 0) {
+                _isProcessing.value = false
+                return@launch
+            }
+
+            val s = startPage.coerceIn(1, total)
+            val e = endPage.coerceIn(s, total)
+
             val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
             val sanitized = if (outputName.endsWith(".pdf", ignoreCase = true)) outputName else "$outputName.pdf"
             val destFile = File(docsDir, "${System.currentTimeMillis()}_$sanitized")
-            val pageIndices = ((startPage - 1).coerceAtLeast(0) until endPage.coerceAtMost(doc.pageCount)).toList()
-            val success = PdfEngine.rearrangePages(file, pageIndices, destFile)
-            if (success) {
+
+            val subPages = currentState.pages.subList(s - 1, e)
+            val splitState = FolioDocumentState(
+                docItem = currentState.docItem,
+                sourceFile = currentState.sourceFile,
+                pages = subPages,
+                hasUnsavedChanges = false
+            )
+
+            val success = PdfEngine.saveDocumentState(splitState, destFile)
+            if (success && PdfEngine.verifyExportedDocument(destFile, splitState)) {
                 val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
                 val newItem = PdfDocumentItem(
                     title = sanitized,
                     filePath = destFile.absolutePath,
                     fileSize = destFile.length(),
-                    pageCount = pageIndices.size,
+                    pageCount = subPages.size,
                     thumbnailPath = thumb,
                     category = doc.category
                 )
                 val id = repository.addDocument(newItem)
-                _statusMessage.value = "Extracted ${pageIndices.size} page(s) to $sanitized"
+                _statusMessage.value = "Extracted ${subPages.size} page(s) to $sanitized"
                 openDocument(newItem.copy(id = id))
             } else {
                 _statusMessage.value = "Failed to split PDF"
@@ -612,19 +814,36 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun splitPdfAll(doc: PdfDocumentItem) {
-        val file = File(doc.filePath)
-        if (!file.exists()) return
         viewModelScope.launch {
             _isProcessing.value = true
+            val currentState = if (_docState.value?.docItem?.id == doc.id) {
+                _docState.value!!
+            } else {
+                val file = File(doc.filePath)
+                val pCount = PdfEngine.getPageCount(file)
+                FolioDocumentState(
+                    docItem = doc,
+                    sourceFile = file,
+                    pages = (0 until maxOf(1, pCount)).map { FolioPageState(originalPageIndex = it) }
+                )
+            }
+
             val docsDir = File(getApplication<Application>().filesDir, "documents").apply { mkdirs() }
             var count = 0
-            for (p in 0 until doc.pageCount) {
-                val destFile = File(docsDir, "${System.currentTimeMillis()}_${doc.title.removeSuffix(".pdf")}_page_${p + 1}.pdf")
-                if (PdfEngine.rearrangePages(file, listOf(p), destFile)) {
+            currentState.pages.forEachIndexed { idx, pageState ->
+                val pageTitle = "${doc.title.removeSuffix(".pdf")}_page_${idx + 1}.pdf"
+                val destFile = File(docsDir, "${System.currentTimeMillis()}_$pageTitle")
+                val singlePageState = FolioDocumentState(
+                    docItem = currentState.docItem,
+                    sourceFile = currentState.sourceFile,
+                    pages = listOf(pageState),
+                    hasUnsavedChanges = false
+                )
+                if (PdfEngine.saveDocumentState(singlePageState, destFile)) {
                     count++
                     val thumb = PdfEngine.generateThumbnail(getApplication(), destFile, 0)
                     val newItem = PdfDocumentItem(
-                        title = "${doc.title.removeSuffix(".pdf")}_page_${p + 1}.pdf",
+                        title = pageTitle,
                         filePath = destFile.absolutePath,
                         fileSize = destFile.length(),
                         pageCount = 1,
@@ -655,7 +874,29 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         return@withContext sb.toString().trim()
     }
 
+    fun rotateAllPages(degrees: Float = 90f) {
+        val state = _docState.value ?: return
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        val updatedPages = state.pages.map {
+            it.copy(rotationDegrees = (it.rotationDegrees + degrees) % 360f)
+        }
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        viewModelScope.launch {
+            loadActivePage()
+        }
+        _statusMessage.value = "Rotated all pages by ${degrees.toInt()}°"
+    }
+
     fun rotateDocumentPages(doc: PdfDocumentItem, degrees: Float) {
+        val currentState = _docState.value
+        if (currentState != null && currentState.docItem.id == doc.id) {
+            rotateAllPages(degrees)
+            return
+        }
+
         val file = File(doc.filePath)
         if (!file.exists()) return
         viewModelScope.launch {
@@ -756,26 +997,40 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun applyPageNumbers(format: String) {
-        val doc = _activeDocument.value ?: return
-        for (p in 0 until doc.pageCount) {
+        val state = _docState.value ?: return
+        undoStateStack.add(state)
+        redoStateStack.clear()
+
+        val updatedPages = state.pages.mapIndexed { p, pageState ->
             val numText = when (format) {
-                "Page X of Y" -> "Page ${p + 1} of ${doc.pageCount}"
+                "Page X of Y" -> "Page ${p + 1} of ${state.pages.size}"
                 "Page X" -> "Page ${p + 1}"
-                "X / Y" -> "${p + 1} / ${doc.pageCount}"
+                "X / Y" -> "${p + 1} / ${state.pages.size}"
                 else -> "${p + 1}"
             }
-            addAnnotation(
-                AnnotationData(
-                    pageIndex = p,
-                    type = AnnotationType.PAGE_NUMBER,
-                    text = numText
-                )
+            val annot = AnnotationData(
+                pageIndex = p,
+                type = AnnotationType.PAGE_NUMBER,
+                text = numText
             )
+            pageState.copy(annotations = pageState.annotations + annot)
+        }
+
+        _docState.value = state.copy(pages = updatedPages, hasUnsavedChanges = true)
+        viewModelScope.launch {
+            loadActivePage()
         }
         _statusMessage.value = "Applied page numbers ($format)"
     }
 
     fun rearrangeDocument(doc: PdfDocumentItem, newOrder: List<Int>) {
+        val currentState = _docState.value
+        if (currentState != null && currentState.docItem.id == doc.id) {
+            val reorderedPages = newOrder.mapNotNull { currentState.pages.getOrNull(it) }
+            updateDocumentPages(reorderedPages)
+            return
+        }
+
         val sourceFile = File(doc.filePath)
         if (!sourceFile.exists()) return
 

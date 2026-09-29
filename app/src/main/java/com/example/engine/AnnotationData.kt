@@ -20,6 +20,13 @@ enum class AnnotationType {
     PAGE_NUMBER
 }
 
+sealed class PdfValidationResult {
+    object Valid : PdfValidationResult()
+    object PasswordProtected : PdfValidationResult()
+    object CorruptedOrNotPdf : PdfValidationResult()
+    object EmptyOrZeroPages : PdfValidationResult()
+}
+
 data class RectFData(
     val left: Float,
     val top: Float,
@@ -69,3 +76,20 @@ data class CompressionResult(
     val savedPercentage: Int,
     val outputFile: java.io.File
 )
+
+data class FolioPageState(
+    val pageId: String = java.util.UUID.randomUUID().toString(),
+    val originalPageIndex: Int, // 0-based page index in the original source PDF
+    val rotationDegrees: Float = 0f, // 0f, 90f, 180f, 270f
+    val annotations: List<AnnotationData> = emptyList(),
+    val textBlocks: List<PdfTextBlock> = emptyList()
+)
+
+data class FolioDocumentState(
+    val docItem: com.example.data.model.PdfDocumentItem,
+    val sourceFile: java.io.File,
+    val pages: List<FolioPageState> = emptyList(),
+    val hasUnsavedChanges: Boolean = false
+) {
+    val pageCount: Int get() = pages.size
+}

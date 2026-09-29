@@ -138,7 +138,14 @@ fun EditDocumentTextDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "Replaces the visible text on this page",
+                    fontSize = 11.sp,
+                    color = InkSecondary,
+                    modifier = Modifier.padding(top = 6.dp)
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
 
                 Text(
                     text = "Replacement Text:",

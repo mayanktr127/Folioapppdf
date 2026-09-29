@@ -290,20 +290,39 @@ fun SplitPdfDialog(
                     )
                     Text("Extract All Pages into Separate PDFs", fontSize = 13.sp, color = InkPrimary)
                 }
+
+                val sNum = startPageStr.toIntOrNull()
+                val eNum = endPageStr.toIntOrNull()
+                val isRangeValid = splitMode == "all" || (sNum != null && eNum != null && sNum in 1..doc.pageCount && eNum in 1..doc.pageCount && sNum <= eNum)
+
+                if (splitMode == "range" && !isRangeValid) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Invalid page range. Must be between 1 and ${doc.pageCount} (From ≤ To).",
+                        fontSize = 11.sp,
+                        color = Color.Red,
+                        modifier = Modifier.padding(start = 32.dp)
+                    )
+                }
             }
         },
         confirmButton = {
+            val sNum = startPageStr.toIntOrNull()
+            val eNum = endPageStr.toIntOrNull()
+            val isRangeValid = splitMode == "all" || (sNum != null && eNum != null && sNum in 1..doc.pageCount && eNum in 1..doc.pageCount && sNum <= eNum)
+
             Button(
                 onClick = {
                     if (splitMode == "range") {
-                        val s = (startPageStr.toIntOrNull() ?: 1).coerceIn(1, doc.pageCount)
-                        val e = (endPageStr.toIntOrNull() ?: doc.pageCount).coerceIn(s, doc.pageCount)
-                        onSplitRange(s, e, splitTitle)
+                        if (sNum != null && eNum != null) {
+                            onSplitRange(sNum, eNum, splitTitle)
+                        }
                     } else {
                         onSplitAll()
                     }
                     onDismiss()
                 },
+                enabled = isRangeValid,
                 colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary),
                 shape = RoundedCornerShape(10.dp)
             ) {

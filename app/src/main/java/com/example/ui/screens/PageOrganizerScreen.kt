@@ -30,10 +30,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -48,9 +46,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -63,7 +61,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
+import com.example.engine.FolioPageState
 import com.example.engine.PdfEngine
 import com.example.ui.theme.BorderLight
 import com.example.ui.theme.CanvasBackground
@@ -74,6 +72,7 @@ import com.example.ui.theme.InkSecondary
 import com.example.ui.theme.SurfaceWhite
 import com.example.ui.viewmodel.PdfViewModel
 import java.io.File
+import java.util.UUID
 
 @Composable
 fun PageOrganizerScreen(
@@ -83,25 +82,27 @@ fun PageOrganizerScreen(
 ) {
     BackHandler { onBack() }
 
-    val activeDoc by viewModel.activeDocument.collectAsState()
+    val docState by viewModel.docState.collectAsState()
     val isProcessing by viewModel.isProcessing.collectAsState()
 
-    // Working page order (indices)
-    val pageOrder = remember { mutableStateListOf<Int>() }
-    var selectedIndex by remember { mutableStateOf(0) }
-    val pageThumbnails = remember { mutableStateMapOf<Int, Bitmap>() }
+    // Working page states list (shared document state representation)
+    val workingPages = remember { mutableStateListOf<FolioPageState>() }
+    var selectedIndex by remember { mutableIntStateOf(0) }
+    val pageThumbnails = remember { mutableStateMapOf<String, Bitmap>() }
 
-    LaunchedEffect(activeDoc) {
-        val doc = activeDoc ?: return@LaunchedEffect
-        pageOrder.clear()
-        for (i in 0 until doc.pageCount) {
-            pageOrder.add(i)
+    LaunchedEffect(docState) {
+        val state = docState ?: return@LaunchedEffect
+        workingPages.clear()
+        workingPages.addAll(state.pages)
+        if (selectedIndex >= workingPages.size) {
+            selectedIndex = (workingPages.size - 1).coerceAtLeast(0)
         }
-        val file = File(doc.filePath)
+
+        val file = state.sourceFile
         if (file.exists()) {
-            for (i in 0 until doc.pageCount) {
-                val bmp = PdfEngine.renderPageToBitmap(file, i, targetWidth = 360)
-                if (bmp != null) pageThumbnails[i] = bmp
+            workingPages.forEach { page ->
+                val bmp = PdfEngine.renderPageStateToBitmap(file, page, targetWidth = 360)
+                if (bmp != null) pageThumbnails[page.pageId] = bmp
             }
         }
     }
@@ -111,7 +112,7 @@ fun PageOrganizerScreen(
             .fillMaxSize()
             .background(CanvasBackground)
     ) {
-        // Header matching Image 3
+        // Header
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = SurfaceWhite,
@@ -142,7 +143,7 @@ fun PageOrganizerScreen(
                             color = InkPrimary
                         )
                         Text(
-                            text = "Just drag or step them into place",
+                            text = "Reorder, rotate, duplicate, or delete pages",
                             fontSize = 12.sp,
                             color = InkSecondary
                         )
@@ -151,11 +152,12 @@ fun PageOrganizerScreen(
 
                 Button(
                     onClick = {
-                        activeDoc?.let { doc ->
-                            viewModel.rearrangeDocument(doc, pageOrder.toList())
+                        if (workingPages.isNotEmpty()) {
+                            viewModel.updateDocumentPages(workingPages.toList())
+                            onBack()
                         }
                     },
-                    enabled = !isProcessing && pageOrder.isNotEmpty(),
+                    enabled = !isProcessing && workingPages.isNotEmpty(),
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary),
                     modifier = Modifier.testTag("apply_rearrange_btn")
@@ -170,6 +172,34 @@ fun PageOrganizerScreen(
                         Text("Apply", fontWeight = FontWeight.Bold)
                     }
                 }
+            }
+        }
+
+        // Live preview of resulting page order
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = CranberryPale.copy(alpha = 0.5f)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Result Order: ${workingPages.mapIndexed { idx, p -> "${idx + 1}(P${p.originalPageIndex + 1}${if (p.rotationDegrees != 0f) " ${p.rotationDegrees.toInt()}°" else ""})" }.joinToString(" → ")}",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = CranberryPrimary,
+                    maxLines = 1
+                )
+                Text(
+                    text = "${workingPages.size} pages",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = CranberryPrimary
+                )
             }
         }
 
@@ -190,19 +220,19 @@ fun PageOrganizerScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Page ${selectedIndex + 1} of ${pageOrder.size}",
+                    text = if (workingPages.isNotEmpty()) "Selected: Page ${selectedIndex + 1} of ${workingPages.size}" else "0 Pages",
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = InkPrimary
                 )
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    // Move Left / Up
+                    // Move Earlier / Up
                     IconButton(
                         onClick = {
                             if (selectedIndex > 0) {
-                                val item = pageOrder.removeAt(selectedIndex)
-                                pageOrder.add(selectedIndex - 1, item)
+                                val item = workingPages.removeAt(selectedIndex)
+                                workingPages.add(selectedIndex - 1, item)
                                 selectedIndex--
                             }
                         },
@@ -212,29 +242,58 @@ fun PageOrganizerScreen(
                         Icon(Icons.Default.ArrowUpward, contentDescription = "Move Earlier", tint = CranberryPrimary)
                     }
 
-                    // Move Right / Down
+                    // Move Later / Down
                     IconButton(
                         onClick = {
-                            if (selectedIndex < pageOrder.size - 1) {
-                                val item = pageOrder.removeAt(selectedIndex)
-                                pageOrder.add(selectedIndex + 1, item)
+                            if (selectedIndex < workingPages.size - 1) {
+                                val item = workingPages.removeAt(selectedIndex)
+                                workingPages.add(selectedIndex + 1, item)
                                 selectedIndex++
                             }
                         },
-                        enabled = selectedIndex < pageOrder.size - 1,
+                        enabled = selectedIndex < workingPages.size - 1,
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(Icons.Default.ArrowDownward, contentDescription = "Move Later", tint = CranberryPrimary)
                     }
 
+                    // Rotate 90°
+                    IconButton(
+                        onClick = {
+                            if (workingPages.isNotEmpty() && selectedIndex in 0 until workingPages.size) {
+                                val current = workingPages[selectedIndex]
+                                val newRot = (current.rotationDegrees + 90f) % 360f
+                                val updated = current.copy(rotationDegrees = newRot)
+                                workingPages[selectedIndex] = updated
+
+                                // Update thumbnail with rotation
+                                docState?.sourceFile?.let { f ->
+                                    val bmp = kotlinx.coroutines.runBlocking {
+                                        PdfEngine.renderPageStateToBitmap(f, updated, targetWidth = 360)
+                                    }
+                                    if (bmp != null) pageThumbnails[updated.pageId] = bmp
+                                }
+                            }
+                        },
+                        enabled = workingPages.isNotEmpty(),
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(Icons.Default.RotateRight, contentDescription = "Rotate 90°", tint = CranberryPrimary)
+                    }
+
                     // Duplicate
                     IconButton(
                         onClick = {
-                            if (pageOrder.isNotEmpty()) {
-                                val current = pageOrder[selectedIndex]
-                                pageOrder.add(selectedIndex + 1, current)
+                            if (workingPages.isNotEmpty() && selectedIndex in 0 until workingPages.size) {
+                                val current = workingPages[selectedIndex]
+                                val dup = current.copy(pageId = UUID.randomUUID().toString())
+                                workingPages.add(selectedIndex + 1, dup)
+                                pageThumbnails[current.pageId]?.let {
+                                    pageThumbnails[dup.pageId] = it
+                                }
                             }
                         },
+                        enabled = workingPages.isNotEmpty(),
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(Icons.Default.ContentCopy, contentDescription = "Duplicate", tint = InkSecondary)
@@ -243,14 +302,16 @@ fun PageOrganizerScreen(
                     // Delete
                     IconButton(
                         onClick = {
-                            if (pageOrder.size > 1) {
-                                pageOrder.removeAt(selectedIndex)
-                                if (selectedIndex >= pageOrder.size) selectedIndex = pageOrder.size - 1
+                            if (workingPages.size > 1) {
+                                workingPages.removeAt(selectedIndex)
+                                if (selectedIndex >= workingPages.size) {
+                                    selectedIndex = workingPages.size - 1
+                                }
                             } else {
                                 viewModel.setStatusMessage("A document must have at least 1 page.")
                             }
                         },
-                        enabled = pageOrder.size > 1,
+                        enabled = workingPages.size > 1,
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(Icons.Default.Delete, contentDescription = "Delete Page", tint = Color.Red)
@@ -259,7 +320,7 @@ fun PageOrganizerScreen(
             }
         }
 
-        // Thumbnails Grid matching Image 3
+        // Page Grid
         LazyVerticalGrid(
             columns = GridCells.Fixed(2),
             modifier = Modifier
@@ -269,9 +330,9 @@ fun PageOrganizerScreen(
             horizontalArrangement = Arrangement.spacedBy(14.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            itemsIndexed(pageOrder) { index, originalPageIndex ->
+            itemsIndexed(workingPages) { index, pageState ->
                 val isSelected = selectedIndex == index
-                val bmp = pageThumbnails[originalPageIndex]
+                val bmp = pageThumbnails[pageState.pageId]
 
                 Card(
                     modifier = Modifier
@@ -280,13 +341,15 @@ fun PageOrganizerScreen(
                         .border(
                             width = if (isSelected) 2.5.dp else 1.dp,
                             color = if (isSelected) CranberryPrimary else BorderLight,
-                            shape = RoundedCornerShape(14.dp)
+                            shape = RoundedCornerShape(12.dp)
                         ),
-                    shape = RoundedCornerShape(14.dp),
+                    shape = RoundedCornerShape(12.dp),
                     colors = CardDefaults.cardColors(containerColor = SurfaceWhite)
                 ) {
                     Column(
-                        modifier = Modifier.padding(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(10.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Box(
@@ -311,7 +374,6 @@ fun PageOrganizerScreen(
                                 )
                             }
 
-                            // Selection checkmark matching Image 3
                             if (isSelected) {
                                 Box(
                                     modifier = Modifier
@@ -333,18 +395,31 @@ fun PageOrganizerScreen(
 
                         Spacer(modifier = Modifier.height(8.dp))
 
-                        // Page pill badge matching Image 3 (e.g. "1")
-                        Surface(
-                            shape = CircleShape,
-                            color = if (isSelected) CranberryPrimary else BorderLight,
-                            modifier = Modifier.size(28.dp)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
                         ) {
-                            Box(contentAlignment = Alignment.Center) {
+                            Surface(
+                                shape = CircleShape,
+                                color = if (isSelected) CranberryPrimary else BorderLight,
+                                modifier = Modifier.size(26.dp)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(
+                                        text = "${index + 1}",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isSelected) Color.White else InkPrimary
+                                    )
+                                }
+                            }
+                            if (pageState.rotationDegrees != 0f) {
+                                Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = "${index + 1}",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (isSelected) Color.White else InkPrimary
+                                    text = "${pageState.rotationDegrees.toInt()}°",
+                                    fontSize = 10.sp,
+                                    color = CranberryPrimary,
+                                    fontWeight = FontWeight.Bold
                                 )
                             }
                         }

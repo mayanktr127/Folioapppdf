@@ -110,6 +110,8 @@ fun EditorScreen(
 
     val context = LocalContext.current
     val activeDoc by viewModel.activeDocument.collectAsState()
+    val docState by viewModel.docState.collectAsState()
+    val hasUnsavedChanges by viewModel.hasUnsavedChanges.collectAsState()
     val activePageIndex by viewModel.activePageIndex.collectAsState()
     val pageBitmap by viewModel.activePageBitmap.collectAsState()
     val textBlocks by viewModel.currentTextBlocks.collectAsState()
@@ -184,15 +186,16 @@ fun EditorScreen(
                     modifier = Modifier.weight(1f).padding(horizontal = 6.dp)
                 ) {
                     Text(
-                        text = doc?.title ?: "Document.pdf",
+                        text = docState?.docItem?.title ?: doc?.title ?: "Document.pdf",
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Bold,
                         color = InkPrimary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    val totalPages = docState?.pageCount ?: doc?.pageCount ?: 1
                     Text(
-                        text = "Page ${activePageIndex + 1} of ${doc?.pageCount ?: 1}",
+                        text = "Page ${activePageIndex + 1} of $totalPages",
                         fontSize = 11.sp,
                         color = InkSecondary
                     )
@@ -250,7 +253,7 @@ fun EditorScreen(
 
                     Spacer(modifier = Modifier.width(4.dp))
 
-                    // Red "Save a copy" button
+                    // Red "Save a copy" button with persistent unsaved changes indicator dot
                     Button(
                         onClick = { viewModel.saveAnnotatedCopy() },
                         modifier = Modifier.height(34.dp).testTag("editor_save_btn"),
@@ -258,11 +261,22 @@ fun EditorScreen(
                         colors = ButtonDefaults.buttonColors(containerColor = CranberryPrimary),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 0.dp)
                     ) {
-                        Text(
-                            text = "Save copy",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (hasUnsavedChanges) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFFBBF24))
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                            }
+                            Text(
+                                text = if (hasUnsavedChanges) "Save copy *" else "Save copy",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
             }
@@ -299,7 +313,7 @@ fun EditorScreen(
                         }
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = if (activeTool == EditorTool.EDIT_PDF_TEXT) "Tap any text box on the page to edit" else "Active: ${activeTool.name}",
+                            text = if (activeTool == EditorTool.EDIT_PDF_TEXT) "Tap any text box to replace visible text on this page" else "Active: ${activeTool.name}",
                             fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = CranberryPrimary
@@ -733,7 +747,8 @@ fun EditorScreen(
                 }
             }
 
-            if (doc != null && activePageIndex < doc.pageCount - 1) {
+            val totalPages = docState?.pageCount ?: doc?.pageCount ?: 1
+            if (activePageIndex < totalPages - 1) {
                 IconButton(
                     onClick = { viewModel.setPageIndex(activePageIndex + 1) },
                     modifier = Modifier

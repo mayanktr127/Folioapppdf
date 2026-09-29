@@ -10,6 +10,7 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
@@ -17,6 +18,7 @@ import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import kotlin.math.max
 import kotlin.math.min
@@ -97,6 +99,172 @@ object PdfEngine {
         } catch (e: Exception) {
             Log.e(TAG, "Error generating thumbnail", e)
             return@withContext null
+        }
+    }
+
+    fun validatePdfFile(pdfFile: File): PdfValidationResult {
+        if (!pdfFile.exists() || pdfFile.length() < 10) {
+            return PdfValidationResult.EmptyOrZeroPages
+        }
+        try {
+            FileInputStream(pdfFile).use { fis ->
+                val header = ByteArray(5)
+                val read = fis.read(header)
+                if (read < 5 || String(header) != "%PDF-") {
+                    return PdfValidationResult.CorruptedOrNotPdf
+                }
+            }
+        } catch (e: Exception) {
+            return PdfValidationResult.CorruptedOrNotPdf
+        }
+
+        var pfd: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        try {
+            pfd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = PdfRenderer(pfd)
+            if (renderer.pageCount <= 0) {
+                return PdfValidationResult.EmptyOrZeroPages
+            }
+            return PdfValidationResult.Valid
+        } catch (e: SecurityException) {
+            return PdfValidationResult.PasswordProtected
+        } catch (e: Exception) {
+            val msg = e.message?.lowercase() ?: ""
+            if (msg.contains("password") || msg.contains("encrypt")) {
+                return PdfValidationResult.PasswordProtected
+            }
+            return PdfValidationResult.CorruptedOrNotPdf
+        } finally {
+            renderer?.close()
+            pfd?.close()
+        }
+    }
+
+    suspend fun renderPageStateToBitmap(
+        sourcePdf: File,
+        pageState: FolioPageState,
+        targetWidth: Int = 1080
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val baseBmp = renderPageToBitmap(sourcePdf, pageState.originalPageIndex, targetWidth) ?: return@withContext null
+        val rot = (pageState.rotationDegrees % 360f + 360f) % 360f
+        if (rot == 0f) {
+            return@withContext baseBmp
+        }
+        try {
+            val matrix = Matrix().apply { postRotate(rot) }
+            val rotated = Bitmap.createBitmap(baseBmp, 0, 0, baseBmp.width, baseBmp.height, matrix, true)
+            if (rotated != baseBmp) {
+                baseBmp.recycle()
+            }
+            return@withContext rotated
+        } catch (e: Exception) {
+            Log.e(TAG, "Error rotating page bitmap", e)
+            return@withContext baseBmp
+        }
+    }
+
+    suspend fun getPageDimensions(pdfFile: File, pageIndex: Int): Pair<Int, Int>? = withContext(Dispatchers.IO) {
+        if (!pdfFile.exists() || pdfFile.length() == 0L) return@withContext null
+        var pfd: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        var page: PdfRenderer.Page? = null
+        try {
+            pfd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = PdfRenderer(pfd)
+            if (pageIndex in 0 until renderer.pageCount) {
+                page = renderer.openPage(pageIndex)
+                return@withContext Pair(page.width, page.height)
+            }
+            return@withContext null
+        } catch (_: Exception) {
+            return@withContext null
+        } finally {
+            page?.close()
+            renderer?.close()
+            pfd?.close()
+        }
+    }
+
+    suspend fun saveDocumentState(
+        state: FolioDocumentState,
+        outputFile: File
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (state.pages.isEmpty() || !state.sourceFile.exists()) return@withContext false
+        val doc = PdfDocument()
+
+        try {
+            state.pages.forEachIndexed { newIndex, pageState ->
+                val origDims = getPageDimensions(state.sourceFile, pageState.originalPageIndex)
+                val origW = origDims?.first ?: 595
+                val origH = origDims?.second ?: 842
+                val rot = (pageState.rotationDegrees % 360f + 360f) % 360f
+                val isSwapped = (rot == 90f || rot == 270f)
+                val targetPageW = if (isSwapped) origH else origW
+                val targetPageH = if (isSwapped) origW else origH
+
+                // High-resolution bitmap render for crisp fidelity
+                val renderW = max(targetPageW, 1200)
+                val pageBmp = renderPageStateToBitmap(state.sourceFile, pageState, targetWidth = renderW) ?: return@forEachIndexed
+
+                val pageInfo = PdfDocument.PageInfo.Builder(targetPageW, targetPageH, newIndex + 1).create()
+                val page = doc.startPage(pageInfo)
+                val canvas = page.canvas
+
+                // Draw base page scaled to target points
+                val dstRect = RectF(0f, 0f, targetPageW.toFloat(), targetPageH.toFloat())
+                canvas.drawBitmap(pageBmp, null, dstRect, null)
+
+                // Draw annotations for this page in target page coordinate space
+                for (annot in pageState.annotations) {
+                    drawAnnotation(canvas, annot, targetPageW.toFloat(), targetPageH.toFloat(), baseBitmap = pageBmp)
+                }
+
+                doc.finishPage(page)
+                pageBmp.recycle()
+            }
+
+            FileOutputStream(outputFile).use { out ->
+                doc.writeTo(out)
+            }
+            return@withContext outputFile.exists() && outputFile.length() > 0
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving document state", e)
+            return@withContext false
+        } finally {
+            doc.close()
+        }
+    }
+
+    suspend fun verifyExportedDocument(
+        outputFile: File,
+        expectedState: FolioDocumentState
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!outputFile.exists() || outputFile.length() == 0L) return@withContext false
+        var pfd: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        try {
+            pfd = ParcelFileDescriptor.open(outputFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = PdfRenderer(pfd)
+            if (renderer.pageCount != expectedState.pages.size) {
+                Log.e(TAG, "Verify failed: expected ${expectedState.pages.size} pages, got ${renderer.pageCount}")
+                return@withContext false
+            }
+            // Spot check page bounds
+            for (i in 0 until minOf(renderer.pageCount, 10)) {
+                val page = renderer.openPage(i)
+                val w = page.width
+                val h = page.height
+                page.close()
+                if (w <= 0 || h <= 0) return@withContext false
+            }
+            return@withContext true
+        } catch (e: Exception) {
+            Log.e(TAG, "Verify failed with exception", e)
+            return@withContext false
+        } finally {
+            renderer?.close()
+            pfd?.close()
         }
     }
 
@@ -402,7 +570,7 @@ object PdfEngine {
                 // Draw annotations on this page
                 val pageAnnots = annotationsByPage[pageIdx] ?: emptyList()
                 for (annot in pageAnnots) {
-                    drawAnnotation(canvas, annot, pageW.toFloat(), pageH.toFloat())
+                    drawAnnotation(canvas, annot, pageW.toFloat(), pageH.toFloat(), baseBitmap = pageBmp)
                 }
 
                 doc.finishPage(page)
@@ -421,7 +589,7 @@ object PdfEngine {
         }
     }
 
-    private fun drawAnnotation(canvas: Canvas, annot: AnnotationData, pageW: Float, pageH: Float) {
+    private fun drawAnnotation(canvas: Canvas, annot: AnnotationData, pageW: Float, pageH: Float, baseBitmap: Bitmap? = null) {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = annot.color
             strokeWidth = annot.strokeWidth
@@ -506,27 +674,64 @@ object PdfEngine {
             }
             AnnotationType.TEXT_REPLACE -> {
                 annot.rect?.let { r ->
-                    // 1. Cleanly clear original text box with white fill
+                    val leftPx = (r.left * pageW).coerceIn(0f, pageW)
+                    val topPx = (r.top * pageH).coerceIn(0f, pageH)
+                    val rightPx = (r.right * pageW).coerceIn(0f, pageW)
+                    val bottomPx = (r.bottom * pageH).coerceIn(0f, pageH)
+
+                    // 1. Sample background color around bounding box corners to match tinted/scanned backgrounds
+                    var bgColor = Color.WHITE
+                    if (baseBitmap != null && !baseBitmap.isRecycled) {
+                        try {
+                            val sampleX = (leftPx - 4f).coerceIn(0f, (baseBitmap.width - 1).toFloat()).toInt()
+                            val sampleY = (topPx - 4f).coerceIn(0f, (baseBitmap.height - 1).toFloat()).toInt()
+                            val sampledPixel = baseBitmap.getPixel(sampleX, sampleY)
+                            val red = Color.red(sampledPixel)
+                            val green = Color.green(sampledPixel)
+                            val blue = Color.blue(sampledPixel)
+                            val lum = (0.299f * red + 0.587f * green + 0.114f * blue) / 255f
+                            if (lum > 0.25f) { // not dark text edge
+                                bgColor = sampledPixel
+                            }
+                        } catch (_: Exception) {}
+                    }
+
                     val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = Color.WHITE
+                        color = bgColor
                         style = Paint.Style.FILL
                     }
                     val rectF = RectF(
-                        (r.left * pageW) - 2f,
-                        (r.top * pageH) - 2f,
-                        (r.right * pageW) + 2f,
-                        (r.bottom * pageH) + 2f
+                        max(0f, leftPx - 2f),
+                        max(0f, topPx - 2f),
+                        min(pageW, rightPx + 2f),
+                        min(pageH, bottomPx + 2f)
                     )
                     canvas.drawRect(rectF, bgPaint)
 
-                    // 2. Render modified text with matching typography
-                    val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = annot.color
-                        textSize = max(18f, (r.height * pageH * 0.78f))
-                        isFakeBoldText = annot.strokeWidth > 1f
+                    // 2. Render modified text with matching typography, font fallback and multi-line wrap
+                    val textStr = annot.text ?: ""
+                    if (textStr.isNotEmpty()) {
+                        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = annot.color
+                            val estimatedSize = max(14f, (r.height * pageH * 0.76f))
+                            textSize = estimatedSize
+                            isFakeBoldText = annot.strokeWidth > 1f
+                            typeface = Typeface.DEFAULT
+                        }
+
+                        val lines = textStr.split("\n")
+                        val lineHeight = textPaint.fontSpacing
+                        var currentBaseline = if (lines.size == 1) {
+                            bottomPx - (r.height * pageH * 0.18f)
+                        } else {
+                            topPx + textPaint.textSize
+                        }
+
+                        for (line in lines) {
+                            canvas.drawText(line, leftPx, currentBaseline, textPaint)
+                            currentBaseline += lineHeight
+                        }
                     }
-                    val baseline = (r.bottom * pageH) - (r.height * pageH * 0.18f)
-                    canvas.drawText(annot.text ?: "", r.left * pageW, baseline, textPaint)
                 }
             }
             AnnotationType.SIGNATURE -> {
